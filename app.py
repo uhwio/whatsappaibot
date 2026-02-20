@@ -4,6 +4,7 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import google.generativeai as genai
 from pymongo import MongoClient
+import certifi  # <--- NEW IMPORT
 
 load_dotenv()
 
@@ -20,44 +21,57 @@ MONGO_URI = os.getenv("MONGO_URI")
 genai.configure(api_key=API_KEY)
 model = genai.GenerativeModel('models/gemini-2.5-flash')
 
-# setup mongo
-client = MongoClient(MONGO_URI)
-db = client.whatsapp_bot  # creates a db named 'whatsapp_bot'
-users = db.chats          # creates a collection named 'chats'
+# setup mongo WITH SSL FIX
+# tlsCAFile=certifi.where() fixes the handshake error on linux
+client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+db = client.whatsapp_bot
+users = db.chats
 
 def get_response(uid, prompt):
     try:
-        # 1. fetch history from mongo
         user_doc = users.find_one({"_id": uid})
         
-        # mongo stores lists of dicts, gemini eats that happily
-        history = user_doc['history'] if user_doc else []
+        # deserialize history
+        # (convert list of dicts back to gemini format if needed, 
+        # but usually gemini can take the raw text if we structure it right.
+        # simpler approach: just feed list of dicts)
         
-        # 2. start chat with loaded history
-        chat = model.start_chat(history=history)
+        raw_history = user_doc['history'] if user_doc else []
+        
+        # reconstruct history for gemini
+        gemini_history = []
+        for msg in raw_history:
+            gemini_history.append({
+                "role": msg["role"],
+                "parts": msg["parts"]
+            })
+
+        chat = model.start_chat(history=gemini_history)
         resp = chat.send_message(prompt)
         
-        # 3. convert gemini objects to simple json for mongo
-        # gemini history object is complex, we need to serialize it
+        # serialize new history for mongo
         new_history = []
         for msg in chat.history:
+            # handle parts being a list of objects or strings
+            text_parts = []
+            for part in msg.parts:
+                text_parts.append(part.text)
+                
             new_history.append({
                 "role": msg.role,
-                "parts": [part.text for part in msg.parts]
+                "parts": text_parts
             })
             
-        # 4. save back to mongo (upsert = create if not exists)
         users.update_one(
             {"_id": uid}, 
             {"$set": {"history": new_history}}, 
             upsert=True
         )
-        
         return resp.text
         
     except Exception as e:
         print(f"gemini/mongo crash: {e}")
-        return "brain error, try again"
+        return "brain error"
 
 def reply_wa(target, body):
     url = f"https://graph.facebook.com/v21.0/{PHONE_ID}/messages"
@@ -109,19 +123,15 @@ def inbound():
                 print(f"rx {sender}: {txt}")
 
                 if txt.lower() == "/reset":
-                    # delete from mongo
                     users.delete_one({"_id": sender})
-                    reply_wa(sender, "memory wiped from database")
-                
+                    reply_wa(sender, "memory wiped from db")
                 elif txt.lower() == "ping":
                     reply_wa(sender, "pong")
-                    
                 else:
                     out = get_response(sender, txt)
                     reply_wa(sender, out)
 
         return jsonify({"status": "ok"}), 200
-
     except Exception as e:
         print(f"webhook fatal: {e}")
         return jsonify({"status": "err"}), 500
