@@ -38,8 +38,9 @@ users = db.chats
 processed = db.processed_message_ids
 
 # indexes
+# TTL for dedupe docs
 processed.create_index([("expiresAt", ASCENDING)], expireAfterSeconds=0)
-users.create_index([("_id", ASCENDING)], unique=True)
+# NOTE: Do NOT create an _id index with unique=True. _id is already unique + indexed by default.
 
 
 def _mark_processed_once(message_id: str) -> bool:
@@ -80,14 +81,14 @@ def get_response(uid: str, prompt: str) -> str:
         gemini_history = [
             {"role": m["r"], "parts": [m["t"]]}
             for m in raw_hist
-            if "r" in m and "t" in m
+            if isinstance(m, dict) and "r" in m and "t" in m
         ]
 
         chat = model.start_chat(history=gemini_history)
         resp = chat.send_message(prompt)
         answer = (resp.text or "").strip() or "..."
 
-        # Unlimited history (no slice cap)
+        # Unlimited history (no cap)
         users.update_one(
             {"_id": uid},
             {
@@ -122,8 +123,7 @@ def inbound():
     data = request.get_json(silent=True) or {}
 
     try:
-        entries = data.get("entry", [])
-        for entry in entries:
+        for entry in data.get("entry", []):
             for change in entry.get("changes", []):
                 val = change.get("value", {})
 
@@ -131,16 +131,16 @@ def inbound():
                 if "statuses" in val:
                     continue
 
-                msgs = val.get("messages") or []
-                for msg in msgs:
+                for msg in (val.get("messages") or []):
                     mid = msg.get("id")
                     if not _mark_processed_once(mid):
                         continue
 
                     sender = msg.get("from")
-                    mtype = msg.get("type")
+                    if not sender:
+                        continue
 
-                    if not sender or mtype != "text":
+                    if msg.get("type") != "text":
                         continue
 
                     txt = (msg.get("text") or {}).get("body", "")
