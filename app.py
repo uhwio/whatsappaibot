@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import google.generativeai as genai
 from pymongo import MongoClient, ASCENDING
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, OperationFailure
 import certifi
 
 load_dotenv()
@@ -34,17 +34,42 @@ model = genai.GenerativeModel("models/gemini-2.5-flash")
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client.whatsapp_bot
 
+# chats: one doc per user (_id = sender)
 users = db.chats
-processed = db.processed_message_ids
 
-# indexes
-# TTL for dedupe docs
-processed.create_index([("expiresAt", ASCENDING)], expireAfterSeconds=0)
-# NOTE: Do NOT create an _id index with unique=True. _id is already unique + indexed by default.
+# dedupe collection: store processed WhatsApp message IDs with TTL
+processed = db.wa_processed_message_ids
+
+
+def _safe_create_indexes() -> None:
+    """
+    Create only the indexes we actually need.
+    NEVER create an index on _id manually (Mongo already has it).
+    Also: do not crash app startup if index already exists / permissions restricted.
+    """
+    try:
+        # TTL index for dedupe (expiresAt in UTC)
+        processed.create_index(
+            [("expiresAt", ASCENDING)],
+            expireAfterSeconds=0,
+            name="expiresAt_ttl",
+        )
+    except OperationFailure:
+        # If your Mongo user can't create indexes, the bot can still run;
+        # dedupe will be weaker (duplicates possible on retries).
+        pass
+
+
+_safe_create_indexes()
 
 
 def _mark_processed_once(message_id: str) -> bool:
+    """
+    Returns True if this message_id is new and should be processed.
+    Returns False if already processed.
+    """
     if not message_id:
+        # if missing, allow processing
         return True
 
     expires_at = datetime.now(timezone.utc) + timedelta(hours=DEDUP_TTL_HOURS)
@@ -53,27 +78,39 @@ def _mark_processed_once(message_id: str) -> bool:
         return True
     except DuplicateKeyError:
         return False
+    except OperationFailure:
+        # If we can't insert (permissions/transient), don't block processing.
+        return True
 
 
 def _wa_send_text(to: str, body: str) -> None:
     url = f"https://graph.facebook.com/v21.0/{PHONE_ID}/messages"
-    requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {WA_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "text",
-            "text": {"body": body},
-        },
-        timeout=12,
-    )
+    try:
+        requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {WA_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "text",
+                "text": {"body": body},
+            },
+            timeout=12,
+        )
+    except Exception:
+        # no console logging
+        pass
 
 
 def get_response(uid: str, prompt: str) -> str:
+    """
+    Storage-lean schema:
+      history: [{ "r": "user|model", "t": "..." }, ...]
+    Unlimited history (as you requested).
+    """
     try:
         doc = users.find_one({"_id": uid}, {"history": 1}) or {}
         raw_hist = doc.get("history", [])
@@ -88,7 +125,6 @@ def get_response(uid: str, prompt: str) -> str:
         resp = chat.send_message(prompt)
         answer = (resp.text or "").strip() or "..."
 
-        # Unlimited history (no cap)
         users.update_one(
             {"_id": uid},
             {
@@ -127,11 +163,12 @@ def inbound():
             for change in entry.get("changes", []):
                 val = change.get("value", {})
 
-                # Ignore status updates completely
+                # Ignore status updates entirely (these are the extra webhooks)
                 if "statuses" in val:
                     continue
 
                 for msg in (val.get("messages") or []):
+                    # Deduplicate: only process each WhatsApp message.id once
                     mid = msg.get("id")
                     if not _mark_processed_once(mid):
                         continue
@@ -164,7 +201,7 @@ def inbound():
         return jsonify({"status": "ok"}), 200
 
     except Exception:
-        # Always return 200 to prevent Meta retry spam
+        # Always return 200 so Meta doesn't retry-spam you
         return jsonify({"status": "ok"}), 200
 
 
