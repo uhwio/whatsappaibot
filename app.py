@@ -1,6 +1,8 @@
 import os
 import logging
+import time
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import requests
 from flask import Flask, request, jsonify
@@ -14,7 +16,12 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# Silence Flask request logs
+# --- logging (NO message contents / NO phone numbers) ---
+LOG_LEVEL = os.getenv("LOG_LEVEL", "ERROR").upper()  # ERROR by default
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.ERROR))
+log = logging.getLogger("wa-bot")
+
+# Silence Werkzeug request logs
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 # config
@@ -26,6 +33,17 @@ MONGO_URI = os.getenv("MONGO_URI")
 
 DEDUP_TTL_HOURS = int(os.getenv("DEDUP_TTL_HOURS", "48"))
 
+# Gemini robustness knobs
+GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
+GEMINI_RETRY_BASE_SLEEP = float(os.getenv("GEMINI_RETRY_BASE_SLEEP", "0.8"))  # seconds
+GEMINI_TIMEOUT_NOTE = os.getenv(
+    "GEMINI_FAIL_MESSAGE",
+    "brain error",
+)
+
+# HTTP session reuse
+http = requests.Session()
+
 # setup gemini
 genai.configure(api_key=API_KEY)
 model = genai.GenerativeModel("models/gemini-2.5-flash")
@@ -34,42 +52,35 @@ model = genai.GenerativeModel("models/gemini-2.5-flash")
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client.whatsapp_bot
 
-# chats: one doc per user (_id = sender)
 users = db.chats
-
-# dedupe collection: store processed WhatsApp message IDs with TTL
 processed = db.wa_processed_message_ids
 
 
 def _safe_create_indexes() -> None:
     """
-    Create only the indexes we actually need.
-    NEVER create an index on _id manually (Mongo already has it).
-    Also: do not crash app startup if index already exists / permissions restricted.
+    Create only needed indexes.
+    Never create _id index manually (Mongo already has it).
     """
     try:
-        # TTL index for dedupe (expiresAt in UTC)
         processed.create_index(
             [("expiresAt", ASCENDING)],
             expireAfterSeconds=0,
             name="expiresAt_ttl",
         )
     except OperationFailure:
-        # If your Mongo user can't create indexes, the bot can still run;
-        # dedupe will be weaker (duplicates possible on retries).
+        # If index create is not permitted, proceed anyway.
         pass
 
 
 _safe_create_indexes()
 
 
-def _mark_processed_once(message_id: str) -> bool:
+def _mark_processed_once(message_id: Optional[str]) -> bool:
     """
-    Returns True if this message_id is new and should be processed.
-    Returns False if already processed.
+    Returns True if new -> process it.
+    False if duplicate webhook / retry of same message.
     """
     if not message_id:
-        # if missing, allow processing
         return True
 
     expires_at = datetime.now(timezone.utc) + timedelta(hours=DEDUP_TTL_HOURS)
@@ -79,14 +90,14 @@ def _mark_processed_once(message_id: str) -> bool:
     except DuplicateKeyError:
         return False
     except OperationFailure:
-        # If we can't insert (permissions/transient), don't block processing.
+        # If DB insert fails transiently, don't block processing.
         return True
 
 
 def _wa_send_text(to: str, body: str) -> None:
     url = f"https://graph.facebook.com/v21.0/{PHONE_ID}/messages"
     try:
-        requests.post(
+        http.post(
             url,
             headers={
                 "Authorization": f"Bearer {WA_TOKEN}",
@@ -100,31 +111,59 @@ def _wa_send_text(to: str, body: str) -> None:
             },
             timeout=12,
         )
-    except Exception:
-        # no console logging
-        pass
+    except Exception as e:
+        # No sensitive info; ok to log the exception type only
+        log.error("wa_send_text_failed: %s", type(e).__name__)
+
+
+def _build_gemini_history(raw_hist) -> list:
+    """
+    Convert compact history [{r,t},...] to Gemini format, skipping malformed entries.
+    """
+    out = []
+    if not isinstance(raw_hist, list):
+        return out
+    for m in raw_hist:
+        if not isinstance(m, dict):
+            continue
+        r = m.get("r")
+        t = m.get("t")
+        if r in ("user", "model") and isinstance(t, str) and t.strip():
+            out.append({"role": r, "parts": [t]})
+    return out
+
+
+def _call_gemini_with_retries(gemini_history: list, prompt: str) -> str:
+    """
+    Retries transient Gemini failures with exponential backoff.
+    """
+    last_err = None
+    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+        try:
+            chat = model.start_chat(history=gemini_history)
+            resp = chat.send_message(prompt)
+            text = (resp.text or "").strip()
+            return text if text else "..."
+        except Exception as e:
+            last_err = e
+            # backoff
+            sleep_s = GEMINI_RETRY_BASE_SLEEP * (2 ** (attempt - 1))
+            time.sleep(sleep_s)
+
+    # After retries, raise last error to be handled by caller
+    raise last_err  # type: ignore[misc]
 
 
 def get_response(uid: str, prompt: str) -> str:
-    """
-    Storage-lean schema:
-      history: [{ "r": "user|model", "t": "..." }, ...]
-    Unlimited history (as you requested).
-    """
     try:
         doc = users.find_one({"_id": uid}, {"history": 1}) or {}
         raw_hist = doc.get("history", [])
 
-        gemini_history = [
-            {"role": m["r"], "parts": [m["t"]]}
-            for m in raw_hist
-            if isinstance(m, dict) and "r" in m and "t" in m
-        ]
+        gemini_history = _build_gemini_history(raw_hist)
 
-        chat = model.start_chat(history=gemini_history)
-        resp = chat.send_message(prompt)
-        answer = (resp.text or "").strip() or "..."
+        answer = _call_gemini_with_retries(gemini_history, prompt)
 
+        # Unlimited history (no cap)
         users.update_one(
             {"_id": uid},
             {
@@ -142,8 +181,10 @@ def get_response(uid: str, prompt: str) -> str:
 
         return answer
 
-    except Exception:
-        return "brain error"
+    except Exception as e:
+        # Log only exception type (no content / no uid)
+        log.error("get_response_failed: %s", type(e).__name__)
+        return GEMINI_TIMEOUT_NOTE
 
 
 @app.route("/webhook", methods=["GET"])
@@ -163,12 +204,11 @@ def inbound():
             for change in entry.get("changes", []):
                 val = change.get("value", {})
 
-                # Ignore status updates entirely (these are the extra webhooks)
+                # Ignore status webhooks
                 if "statuses" in val:
                     continue
 
                 for msg in (val.get("messages") or []):
-                    # Deduplicate: only process each WhatsApp message.id once
                     mid = msg.get("id")
                     if not _mark_processed_once(mid):
                         continue
@@ -200,8 +240,9 @@ def inbound():
 
         return jsonify({"status": "ok"}), 200
 
-    except Exception:
-        # Always return 200 so Meta doesn't retry-spam you
+    except Exception as e:
+        # Always 200 to prevent retries; log only exception type
+        log.error("webhook_failed: %s", type(e).__name__)
         return jsonify({"status": "ok"}), 200
 
 
