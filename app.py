@@ -1,150 +1,112 @@
 import os
-import hmac
-import hashlib
-import time
+import logging
+from datetime import datetime, timedelta, timezone
+
 import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import google.generativeai as genai
-from pymongo import MongoClient, ReturnDocument
+from pymongo import MongoClient, ASCENDING
 from pymongo.errors import DuplicateKeyError
 import certifi
 
 load_dotenv()
+
 app = Flask(__name__)
 
+# Silence Flask request logs
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
 # config
-WA_TOKEN  = os.getenv("WHATSAPP_TOKEN")
-PHONE_ID  = os.getenv("PHONE_NUMBER_ID")
-VERIFY    = os.getenv("VERIFY_TOKEN")
-API_KEY   = os.getenv("GEMINI_API_KEY")
+WA_TOKEN = os.getenv("WHATSAPP_TOKEN")
+PHONE_ID = os.getenv("PHONE_NUMBER_ID")
+VERIFY = os.getenv("VERIFY_TOKEN")
+API_KEY = os.getenv("GEMINI_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
 
-# secret used ONLY to hash user ids (do NOT reuse VERIFY_TOKEN)
-UID_SALT = os.getenv("UID_SALT", "change-me-please")
+DEDUP_TTL_HOURS = int(os.getenv("DEDUP_TTL_HOURS", "48"))
 
-# gemini
+# setup gemini
 genai.configure(api_key=API_KEY)
+model = genai.GenerativeModel("models/gemini-2.5-flash")
 
-SYSTEM_INSTRUCTION = (
-    "You are a helpful WhatsApp assistant. "
-    "You may be given a short 'User memory summary' that must NOT include verbatim quotes. "
-    "Do not reveal private data. Keep responses concise unless asked otherwise."
-)
-
-model = genai.GenerativeModel(
-    model_name="models/gemini-2.5-flash",
-    system_instruction=SYSTEM_INSTRUCTION
-)
-
-# mongo
+# setup mongo (TLS fix for Linux)
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client.whatsapp_bot
 
-# stores minimal per-user memory
-users = db.user_state
+users = db.chats
+processed = db.processed_message_ids
 
-# stores message ids we've already processed (TTL)
-seen = db.seen_messages
-
-# ---- One-time indexes (safe to run every boot) ----
-# Dedupe: unique _id + TTL (expires docs automatically)
-# expireAt must be a Date; pymongo handles TTL index on a date field.
-seen.create_index("expireAt", expireAfterSeconds=0)
-
-# Optional: expire inactive users to save storage (e.g. 30 days)
-# Store lastSeen as a Date and expire with TTL index
-users.create_index("lastSeen", expireAfterSeconds=30 * 24 * 3600)
+# indexes
+processed.create_index([("expiresAt", ASCENDING)], expireAfterSeconds=0)
+users.create_index([("_id", ASCENDING)], unique=True)
 
 
-def uid_hash(sender: str) -> str:
-    """Hash the WhatsApp sender id so you never store the phone number."""
-    digest = hmac.new(
-        UID_SALT.encode("utf-8"),
-        sender.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
-    return digest
+def _mark_processed_once(message_id: str) -> bool:
+    if not message_id:
+        return True
 
-
-def mark_seen_once(message_id: str, ttl_seconds: int = 24 * 3600) -> bool:
-    """
-    Returns True if this message_id is new and should be processed.
-    Returns False if already processed.
-    """
-    # store minimal doc with expiry time
-    # using unix -> milliseconds is fine but TTL index needs a datetime object
-    from datetime import datetime, timedelta
-    doc = {"_id": message_id, "expireAt": datetime.utcnow() + timedelta(seconds=ttl_seconds)}
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=DEDUP_TTL_HOURS)
     try:
-        seen.insert_one(doc)
+        processed.insert_one({"_id": message_id, "expiresAt": expires_at})
         return True
     except DuplicateKeyError:
         return False
 
 
-def clamp_text(s: str, max_chars: int) -> str:
-    s = (s or "").strip()
-    if len(s) <= max_chars:
-        return s
-    return s[:max_chars].rstrip() + "…"
-
-
-def update_memory_summary(old_summary: str, new_user_text: str) -> str:
-    """
-    Creates a SMALL memory summary without storing the raw message.
-    We do NOT persist the raw text; we only persist the result summary.
-    """
-    prompt = (
-        "Update the User memory summary based on the new message.\n"
-        "Rules:\n"
-        "- Do NOT quote verbatim.\n"
-        "- Do NOT store phone numbers or identifiable details.\n"
-        "- Keep it short (max ~600 chars).\n\n"
-        f"Current summary:\n{old_summary or '(none)'}\n\n"
-        f"New user message (do not quote it back):\n{new_user_text}\n\n"
-        "Return ONLY the updated summary."
-    )
-    resp = model.generate_content(prompt)
-    return clamp_text(resp.text, 600)
-
-
-def generate_reply(summary: str, user_text: str) -> str:
-    """
-    Generates the assistant reply. We feed summary + current text,
-    but we do not store the raw user_text.
-    """
-    prompt = (
-        f"User memory summary:\n{summary or '(none)'}\n\n"
-        f"User message:\n{user_text}\n\n"
-        "Reply to the user."
-    )
-    resp = model.generate_content(prompt)
-    return (resp.text or "").strip() or "ok"
-
-
-def reply_wa(target: str, body: str) -> None:
+def _wa_send_text(to: str, body: str) -> None:
     url = f"https://graph.facebook.com/v21.0/{PHONE_ID}/messages"
+    requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {WA_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "text",
+            "text": {"body": body},
+        },
+        timeout=12,
+    )
+
+
+def get_response(uid: str, prompt: str) -> str:
     try:
-        res = requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {WA_TOKEN}",
-                "Content-Type": "application/json"
+        doc = users.find_one({"_id": uid}, {"history": 1}) or {}
+        raw_hist = doc.get("history", [])
+
+        gemini_history = [
+            {"role": m["r"], "parts": [m["t"]]}
+            for m in raw_hist
+            if "r" in m and "t" in m
+        ]
+
+        chat = model.start_chat(history=gemini_history)
+        resp = chat.send_message(prompt)
+        answer = (resp.text or "").strip() or "..."
+
+        # Unlimited history (no slice cap)
+        users.update_one(
+            {"_id": uid},
+            {
+                "$push": {
+                    "history": {
+                        "$each": [
+                            {"r": "user", "t": prompt},
+                            {"r": "model", "t": answer},
+                        ]
+                    }
+                }
             },
-            json={
-                "messaging_product": "whatsapp",
-                "to": target,
-                "type": "text",
-                "text": {"body": body}
-            },
-            timeout=10
+            upsert=True,
         )
-        # no message content logs, only status codes if needed
-        if res.status_code != 200:
-            print("wa api fail:", res.status_code)
-    except Exception as e:
-        print("req error:", str(e))
+
+        return answer
+
+    except Exception:
+        return "brain error"
 
 
 @app.route("/webhook", methods=["GET"])
@@ -160,66 +122,51 @@ def inbound():
     data = request.get_json(silent=True) or {}
 
     try:
-        entry = (data.get("entry") or [{}])[0]
-        changes = (entry.get("changes") or [{}])[0]
-        val = changes.get("value") or {}
+        entries = data.get("entry", [])
+        for entry in entries:
+            for change in entry.get("changes", []):
+                val = change.get("value", {})
 
-        # Ignore WhatsApp status callbacks (sent/delivered/read)
-        if "statuses" in val:
-            return jsonify({"status": "ignored_status"}), 200
+                # Ignore status updates completely
+                if "statuses" in val:
+                    continue
 
-        msgs = val.get("messages")
-        if not msgs:
-            return jsonify({"status": "no_message"}), 200
+                msgs = val.get("messages") or []
+                for msg in msgs:
+                    mid = msg.get("id")
+                    if not _mark_processed_once(mid):
+                        continue
 
-        msg = msgs[0]
-        m_type = msg.get("type")
-        if m_type != "text":
-            return jsonify({"status": "ignored_non_text"}), 200
+                    sender = msg.get("from")
+                    mtype = msg.get("type")
 
-        message_id = msg.get("id")
-        sender = msg.get("from")  # needed to reply, not stored
-        txt = (msg.get("text") or {}).get("body", "")
+                    if not sender or mtype != "text":
+                        continue
 
-        # Dedupe: process each WA message id once
-        if message_id and not mark_seen_once(message_id):
-            return jsonify({"status": "duplicate_ignored"}), 200
+                    txt = (msg.get("text") or {}).get("body", "")
+                    if not txt:
+                        continue
 
-        # Hashed user id (no phone stored)
-        uid = uid_hash(sender)
+                    low = txt.strip().lower()
 
-        # Reset command: delete only hashed user state
-        if txt.strip().lower() == "/reset":
-            users.delete_one({"_id": uid})
-            reply_wa(sender, "memory wiped")
-            return jsonify({"status": "ok"}), 200
+                    if low == "/reset":
+                        users.delete_one({"_id": sender})
+                        _wa_send_text(sender, "memory wiped from db")
+                        continue
 
-        # Load minimal summary (small storage)
-        doc = users.find_one({"_id": uid}, {"summary": 1})
-        old_summary = (doc or {}).get("summary", "")
+                    if low == "ping":
+                        _wa_send_text(sender, "pong")
+                        continue
 
-        # Update summary WITHOUT storing txt
-        new_summary = update_memory_summary(old_summary, txt)
+                    out = get_response(sender, txt)
+                    _wa_send_text(sender, out)
 
-        # Generate reply
-        out = generate_reply(new_summary, txt)
-
-        # Store only summary + lastSeen
-        from datetime import datetime
-        users.update_one(
-            {"_id": uid},
-            {"$set": {"summary": new_summary, "lastSeen": datetime.utcnow()}},
-            upsert=True
-        )
-
-        reply_wa(sender, out)
         return jsonify({"status": "ok"}), 200
 
-    except Exception as e:
-        print("webhook fatal:", str(e))
-        return jsonify({"status": "err"}), 500
+    except Exception:
+        # Always return 200 to prevent Meta retry spam
+        return jsonify({"status": "ok"}), 200
 
 
 if __name__ == "__main__":
-    # IMPORTANT: avoid double-processing in dev
-    app.run(port=5000, debug=False, use_reloader=False)
+    app.run(port=5000, debug=False)
