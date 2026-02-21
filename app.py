@@ -1,7 +1,8 @@
 import os
 import logging
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 import requests
 from flask import Flask, request, jsonify
@@ -33,11 +34,21 @@ CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID")
 
 MONGO_URI = os.getenv("MONGO_URI")
 
+# WhatsApp webhook dedupe
 DEDUP_TTL_HOURS = int(os.getenv("DEDUP_TTL_HOURS", "48"))
-CONTEXT_TURNS = int(os.getenv("CONTEXT_TURNS", "12"))
-FAIL_MESSAGE = os.getenv("FAIL_MESSAGE", "brain error")
 
-# Workers AI model id
+# Gemini robustness
+GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "4"))
+GEMINI_RETRY_BASE_SLEEP = float(os.getenv("GEMINI_RETRY_BASE_SLEEP", "0.9"))
+GEMINI_FAIL_MESSAGE = os.getenv("GEMINI_FAIL_MESSAGE", "I’m having trouble right now. Try again in a moment.")
+
+# Context management (keeps Mongo unlimited but Gemini context small)
+CONTEXT_TURNS = int(os.getenv("CONTEXT_TURNS", "12"))          # keep last N msgs verbatim
+SUMMARIZE_MIN_NEW = int(os.getenv("SUMMARIZE_MIN_NEW", "20"))  # summarize when >= N new msgs available (excluding tail)
+SUMMARIZE_MAX_CHUNK = int(os.getenv("SUMMARIZE_MAX_CHUNK", "60"))
+SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "3500"))
+
+# Workers AI model id (image)
 CF_IMAGE_MODEL = os.getenv("CF_IMAGE_MODEL", "@cf/stabilityai/stable-diffusion-xl-base-1.0")
 
 # ------------------ SETUP ------------------
@@ -49,7 +60,12 @@ model = genai.GenerativeModel("models/gemini-2.5-flash")
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client.whatsapp_bot
 
+# users doc:
+# { _id, mode: "chat|img", history:[{r,t}...], summary:str, summarized_upto:int }
 users = db.chats
+
+# dedupe doc:
+# { _id: wa_message_id, expiresAt }
 processed = db.wa_processed_message_ids
 
 
@@ -61,6 +77,12 @@ def _safe_indexes():
 
 
 _safe_indexes()
+
+
+# ------------------ UTILS ------------------
+def _short(s: str, n: int = 400) -> str:
+    s = (s or "").strip().replace("\n", " ")
+    return s[:n] + ("…" if len(s) > n else "")
 
 
 # ------------------ DEDUPE ------------------
@@ -75,6 +97,7 @@ def _mark_processed_once(mid: Optional[str]) -> bool:
     except DuplicateKeyError:
         return False
     except OperationFailure:
+        # if DB is flaky, don't block processing
         return True
 
 
@@ -115,18 +138,8 @@ def send_mode_buttons(to: str):
     )
 
 
-# ------------------ CLOUDFLARE IMAGE GEN (ROBUST) ------------------
-def _short(s: str, n: int = 350) -> str:
-    s = (s or "").strip().replace("\n", " ")
-    return s[:n] + ("…" if len(s) > n else "")
-
-
-def cf_generate_image(prompt: str) -> tuple[Optional[bytes], Optional[str]]:
-    """
-    Returns (image_bytes, error_text).
-    - On success: (bytes, None)
-    - On failure: (None, "Cloudflare AI error (code): ...")
-    """
+# ------------------ CLOUDFLARE IMAGE GEN (binary) ------------------
+def cf_generate_image(prompt: str) -> Tuple[Optional[bytes], Optional[str]]:
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         return None, "Cloudflare not configured (missing CF_ACCOUNT_ID/CF_API_TOKEN)."
 
@@ -135,59 +148,33 @@ def cf_generate_image(prompt: str) -> tuple[Optional[bytes], Optional[str]]:
     try:
         r = http.post(
             url,
-            headers={
-                "Authorization": f"Bearer {CF_API_TOKEN}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"},
             json={"prompt": prompt},
             timeout=90,
         )
 
-        # If not 2xx, capture body safely
         if r.status_code < 200 or r.status_code >= 300:
-            ctype = (r.headers.get("content-type") or "").lower()
-            body_snip = ""
-            try:
-                if "application/json" in ctype:
-                    body_snip = _short(r.text)
-                else:
-                    # could be HTML error page
-                    body_snip = _short(r.text)
-            except Exception:
-                body_snip = ""
-
-            err = f"Cloudflare AI error ({r.status_code}). {body_snip}"
-            log.error("cf_img_http_%s: %s", r.status_code, _short(body_snip, 250))
+            err = f"Cloudflare AI error ({r.status_code}). {_short(r.text)}"
+            log.error("cf_img_http_%s", r.status_code)
             return None, err
 
-        # Success: ensure it actually looks like an image response
         ctype = (r.headers.get("content-type") or "").lower()
         if "image/" in ctype:
             return r.content, None
 
-        # Sometimes providers return JSON even on success; handle unexpected
         if "application/json" in ctype:
-            # likely a structured response you weren't expecting or an edge case
-            txt = _short(r.text)
-            log.error("cf_img_unexpected_json: %s", _short(txt, 250))
-            return None, f"Cloudflare AI returned JSON instead of an image. {txt}"
+            return None, f"Cloudflare AI returned JSON instead of an image. {_short(r.text)}"
 
-        # Unknown content-type
-        log.error("cf_img_unexpected_ctype: %s", ctype)
         return None, f"Cloudflare AI returned unexpected content-type: {ctype}"
 
     except requests.exceptions.Timeout:
-        log.error("cf_img_timeout")
         return None, "Cloudflare AI timed out."
     except Exception as e:
         log.error("cf_img_failed: %s", type(e).__name__)
         return None, "Cloudflare AI request failed."
 
 
-def wa_upload_media(image_bytes: bytes, mime_type: str = "image/jpeg") -> tuple[Optional[str], Optional[str]]:
-    """
-    Returns (media_id, error_text)
-    """
+def wa_upload_media(image_bytes: bytes, mime_type: str = "image/jpeg") -> Tuple[Optional[str], Optional[str]]:
     try:
         url = f"https://graph.facebook.com/v21.0/{PHONE_ID}/media"
         files = {"file": ("image.jpg", image_bytes, mime_type)}
@@ -196,9 +183,7 @@ def wa_upload_media(image_bytes: bytes, mime_type: str = "image/jpeg") -> tuple[
         r = http.post(url, headers={"Authorization": f"Bearer {WA_TOKEN}"}, files=files, data=data, timeout=30)
 
         if r.status_code < 200 or r.status_code >= 300:
-            err = f"WhatsApp media upload error ({r.status_code}). {_short(r.text)}"
-            log.error("wa_media_http_%s", r.status_code)
-            return None, err
+            return None, f"WhatsApp media upload error ({r.status_code}). {_short(r.text)}"
 
         media_id = (r.json() or {}).get("id")
         if not media_id:
@@ -237,32 +222,184 @@ def send_generated_image(to: str, prompt: str):
     )
 
 
-# ------------------ GEMINI CHAT ------------------
-def get_chat_response(uid: str, prompt: str) -> str:
+# ------------------ GEMINI HELPERS ------------------
+def _call_gemini_with_retries(history: List[Dict[str, Any]], prompt: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (text, err_code)
+    err_code: "RATE_LIMIT" | "OTHER"
+    """
+    last_err = None
+    last_err_text = ""
+    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+        try:
+            chat = model.start_chat(history=history)
+            resp = chat.send_message(prompt)
+            text = (resp.text or "").strip()
+            return (text if text else "..."), None
+        except Exception as e:
+            last_err = e
+            # Try to detect 429/503-ish situations from exception string (keeps deps minimal)
+            msg = str(e).lower()
+            last_err_text = msg
+            is_rate = ("429" in msg) or ("rate" in msg) or ("quota" in msg) or ("resource_exhausted" in msg)
+            is_busy = ("503" in msg) or ("unavailable" in msg) or ("timeout" in msg)
+
+            # exponential backoff with a bit of extra time for rate/busy
+            sleep_s = GEMINI_RETRY_BASE_SLEEP * (2 ** (attempt - 1))
+            if is_rate or is_busy:
+                sleep_s += 0.6
+            time.sleep(sleep_s)
+
+    # classify
+    if ("429" in last_err_text) or ("rate" in last_err_text) or ("quota" in last_err_text) or ("resource_exhausted" in last_err_text):
+        return None, "RATE_LIMIT"
+
+    log.error("gemini_failed: %s", type(last_err).__name__ if last_err else "Unknown")
+    return None, "OTHER"
+
+
+def _format_msgs_for_summary(msgs: List[Dict[str, Any]], max_chars: int = 12000) -> str:
+    lines = []
+    total = 0
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        r = m.get("r")
+        t = m.get("t")
+        if r not in ("user", "model") or not isinstance(t, str):
+            continue
+        prefix = "USER" if r == "user" else "ASSISTANT"
+        chunk = f"{prefix}: {t.strip()}\n"
+        if total + len(chunk) > max_chars:
+            break
+        lines.append(chunk)
+        total += len(chunk)
+    return "".join(lines)
+
+
+def _summarize_fold(existing_summary: str, new_msgs: List[Dict[str, Any]]) -> Optional[str]:
+    transcript = _format_msgs_for_summary(new_msgs)
+
+    prompt = (
+        "You maintain a rolling conversation memory.\n"
+        "Update the existing summary by incorporating the NEW TRANSCRIPT.\n\n"
+        "Rules:\n"
+        "- Keep it concise and information-dense.\n"
+        "- Preserve user preferences, goals, decisions, and important facts.\n"
+        "- Do NOT include phone numbers or identifiers.\n"
+        "- Do NOT quote long passages.\n"
+        "- Output ONLY the updated summary text.\n\n"
+        f"EXISTING SUMMARY:\n{(existing_summary or '').strip()}\n\n"
+        f"NEW TRANSCRIPT:\n{transcript}\n"
+    )
+
+    text, err = _call_gemini_with_retries(history=[], prompt=prompt)
+    if not text:
+        return None
+
+    text = text.strip()
+    if len(text) > SUMMARY_MAX_CHARS:
+        text = text[:SUMMARY_MAX_CHARS].rstrip() + "…"
+    return text
+
+
+def _maybe_update_summary(uid: str, doc: Dict[str, Any]) -> Tuple[str, int]:
+    """
+    Summarize older messages (excluding the last CONTEXT_TURNS) into doc.summary.
+    Uses summarized_upto pointer so each message is summarized once.
+    """
+    history = doc.get("history", [])
+    if not isinstance(history, list):
+        history = []
+
+    summary = doc.get("summary", "")
+    if not isinstance(summary, str):
+        summary = ""
+
+    summarized_upto = doc.get("summarized_upto", 0)
+    if not isinstance(summarized_upto, int) or summarized_upto < 0:
+        summarized_upto = 0
+
+    total = len(history)
+    if total <= CONTEXT_TURNS:
+        return summary, summarized_upto
+
+    tail_start = max(0, total - CONTEXT_TURNS)
+    eligible_end = tail_start  # only summarize before this
+
+    if summarized_upto >= eligible_end:
+        return summary, summarized_upto
+
+    new_count = eligible_end - summarized_upto
+    if new_count < SUMMARIZE_MIN_NEW:
+        return summary, summarized_upto
+
+    chunk_end = min(eligible_end, summarized_upto + SUMMARIZE_MAX_CHUNK)
+    chunk = history[summarized_upto:chunk_end]
+
+    updated = _summarize_fold(summary, chunk)
+    if not updated:
+        return summary, summarized_upto
+
     try:
-        doc = users.find_one({"_id": uid}, {"history": 1}) or {}
-        history = doc.get("history", [])
-
-        tail = history[-CONTEXT_TURNS:] if isinstance(history, list) else []
-        gemini_hist = [
-            {"role": m.get("r"), "parts": [m.get("t")]}
-            for m in tail
-            if isinstance(m, dict) and m.get("r") in ("user", "model") and isinstance(m.get("t"), str)
-        ]
-
-        chat = model.start_chat(history=gemini_hist)
-        resp = chat.send_message(prompt)
-        answer = (resp.text or "").strip() or "..."
-
         users.update_one(
             {"_id": uid},
-            {"$push": {"history": {"$each": [{"r": "user", "t": prompt}, {"r": "model", "t": answer}]}}},
+            {"$set": {"summary": updated, "summarized_upto": chunk_end}},
             upsert=True,
         )
+        return updated, chunk_end
+    except Exception as e:
+        log.error("summary_update_failed: %s", type(e).__name__)
+        return summary, summarized_upto
 
-        return answer
-    except Exception:
-        return FAIL_MESSAGE
+
+def _build_gemini_history(summary: str, tail: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+
+    if summary and summary.strip():
+        out.append({"role": "user", "parts": [f"Conversation summary (context only):\n{summary.strip()}"]})
+        out.append({"role": "model", "parts": ["Understood."]})
+
+    for m in tail:
+        if not isinstance(m, dict):
+            continue
+        r = m.get("r")
+        t = m.get("t")
+        if r in ("user", "model") and isinstance(t, str) and t.strip():
+            out.append({"role": r, "parts": [t]})
+
+    return out
+
+
+def get_chat_response(uid: str, prompt: str) -> str:
+    try:
+        doc = users.find_one({"_id": uid}, {"history": 1, "summary": 1, "summarized_upto": 1}) or {}
+        summary, _ = _maybe_update_summary(uid, doc)
+
+        history = doc.get("history", [])
+        if not isinstance(history, list):
+            history = []
+
+        tail = history[-CONTEXT_TURNS:] if CONTEXT_TURNS > 0 else []
+        gemini_hist = _build_gemini_history(summary, tail)
+
+        text, err = _call_gemini_with_retries(gemini_hist, prompt)
+        if not text:
+            if err == "RATE_LIMIT":
+                return "I’m getting rate-limited right now. Try again in a minute."
+            return GEMINI_FAIL_MESSAGE
+
+        # store unlimited history
+        users.update_one(
+            {"_id": uid},
+            {"$push": {"history": {"$each": [{"r": "user", "t": prompt}, {"r": "model", "t": text}]}}},
+            upsert=True,
+        )
+        return text
+
+    except Exception as e:
+        log.error("get_chat_response_failed: %s", type(e).__name__)
+        return GEMINI_FAIL_MESSAGE
 
 
 # ------------------ IMAGE INTENT DETECTION ------------------
@@ -276,6 +413,7 @@ def looks_like_image_request(text: str) -> bool:
         "create a picture",
         "draw",
         "make a picture",
+        "turn this into an image",
     ]
     return any(x in t for x in triggers)
 
@@ -354,6 +492,11 @@ def inbound():
                             send_text(sender, f"Mode set to {arg}.")
                         else:
                             send_text(sender, "Usage: /mode chat  OR  /mode img")
+                        continue
+
+                    if low == "/reset":
+                        users.delete_one({"_id": sender})
+                        send_text(sender, "memory wiped from db")
                         continue
 
                     # auto-detect image requests even in chat mode
