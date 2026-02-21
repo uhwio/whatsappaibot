@@ -16,11 +16,30 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# ------------------ LOGGING (NO CONTENT / NO PHONE NOS) ------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "ERROR").upper()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.ERROR))
-logging.getLogger("werkzeug").setLevel(logging.ERROR)
+# ------------------ LOGGING (GUARANTEED) ------------------
+# Set LOG_LEVEL=INFO (or DEBUG) in .env to see more
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_FILE = os.getenv("LOG_FILE", "bot.log")
+
+handlers: List[logging.Handler] = [logging.StreamHandler()]
+try:
+    handlers.append(logging.FileHandler(LOG_FILE))
+except Exception:
+    # If file can't be created (permissions), still log to stdout
+    pass
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=handlers,
+    force=True,  # <-- important: overrides any prior logging config
+)
+
+# silence request spam from werkzeug but still allow errors from our app
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 log = logging.getLogger("wa-bot")
+
+log.info("BOOT: starting bot (logging active).")
 
 # ------------------ CONFIG ------------------
 WA_TOKEN = os.getenv("WHATSAPP_TOKEN")
@@ -43,8 +62,8 @@ GEMINI_RETRY_BASE_SLEEP = float(os.getenv("GEMINI_RETRY_BASE_SLEEP", "0.9"))
 GEMINI_FAIL_MESSAGE = os.getenv("GEMINI_FAIL_MESSAGE", "I’m having trouble right now. Try again in a moment.")
 
 # Context management (keeps Mongo unlimited but Gemini context small)
-CONTEXT_TURNS = int(os.getenv("CONTEXT_TURNS", "12"))          # keep last N msgs verbatim
-SUMMARIZE_MIN_NEW = int(os.getenv("SUMMARIZE_MIN_NEW", "20"))  # summarize when >= N new msgs available (excluding tail)
+CONTEXT_TURNS = int(os.getenv("CONTEXT_TURNS", "12"))
+SUMMARIZE_MIN_NEW = int(os.getenv("SUMMARIZE_MIN_NEW", "20"))
 SUMMARIZE_MAX_CHUNK = int(os.getenv("SUMMARIZE_MAX_CHUNK", "60"))
 SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "3500"))
 
@@ -60,27 +79,23 @@ model = genai.GenerativeModel("models/gemini-2.5-flash")
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client.whatsapp_bot
 
-# users doc:
-# { _id, mode: "chat|img", history:[{r,t}...], summary:str, summarized_upto:int }
 users = db.chats
-
-# dedupe doc:
-# { _id: wa_message_id, expiresAt }
 processed = db.wa_processed_message_ids
 
 
 def _safe_indexes():
     try:
         processed.create_index([("expiresAt", ASCENDING)], expireAfterSeconds=0, name="expiresAt_ttl")
-    except OperationFailure:
-        pass
+        log.info("BOOT: ensured TTL index for dedupe.")
+    except OperationFailure as e:
+        log.warning("BOOT: cannot create TTL index (permissions?). %s", type(e).__name__)
 
 
 _safe_indexes()
 
 
 # ------------------ UTILS ------------------
-def _short(s: str, n: int = 400) -> str:
+def _short(s: str, n: int = 350) -> str:
     s = (s or "").strip().replace("\n", " ")
     return s[:n] + ("…" if len(s) > n else "")
 
@@ -97,19 +112,20 @@ def _mark_processed_once(mid: Optional[str]) -> bool:
     except DuplicateKeyError:
         return False
     except OperationFailure:
-        # if DB is flaky, don't block processing
         return True
 
 
 # ------------------ WHATSAPP SEND ------------------
 def _wa_send(payload: Dict[str, Any]) -> None:
     try:
-        http.post(
+        r = http.post(
             f"https://graph.facebook.com/v21.0/{PHONE_ID}/messages",
             headers={"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"},
             json=payload,
             timeout=20,
         )
+        if r.status_code < 200 or r.status_code >= 300:
+            log.error("wa_send_http_%s: %s", r.status_code, _short(r.text))
     except Exception as e:
         log.error("wa_send_failed: %s", type(e).__name__)
 
@@ -138,7 +154,7 @@ def send_mode_buttons(to: str):
     )
 
 
-# ------------------ CLOUDFLARE IMAGE GEN (binary) ------------------
+# ------------------ CLOUDFLARE IMAGE GEN ------------------
 def cf_generate_image(prompt: str) -> Tuple[Optional[bytes], Optional[str]]:
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         return None, "Cloudflare not configured (missing CF_ACCOUNT_ID/CF_API_TOKEN)."
@@ -154,20 +170,18 @@ def cf_generate_image(prompt: str) -> Tuple[Optional[bytes], Optional[str]]:
         )
 
         if r.status_code < 200 or r.status_code >= 300:
-            err = f"Cloudflare AI error ({r.status_code}). {_short(r.text)}"
-            log.error("cf_img_http_%s", r.status_code)
-            return None, err
+            log.error("cf_img_http_%s: %s", r.status_code, _short(r.text))
+            return None, f"Cloudflare AI error ({r.status_code}). {_short(r.text)}"
 
         ctype = (r.headers.get("content-type") or "").lower()
         if "image/" in ctype:
             return r.content, None
 
-        if "application/json" in ctype:
-            return None, f"Cloudflare AI returned JSON instead of an image. {_short(r.text)}"
-
-        return None, f"Cloudflare AI returned unexpected content-type: {ctype}"
+        log.error("cf_img_unexpected_ctype: %s body=%s", ctype, _short(r.text))
+        return None, f"Cloudflare AI returned unexpected response. {ctype}"
 
     except requests.exceptions.Timeout:
+        log.error("cf_img_timeout")
         return None, "Cloudflare AI timed out."
     except Exception as e:
         log.error("cf_img_failed: %s", type(e).__name__)
@@ -183,10 +197,12 @@ def wa_upload_media(image_bytes: bytes, mime_type: str = "image/jpeg") -> Tuple[
         r = http.post(url, headers={"Authorization": f"Bearer {WA_TOKEN}"}, files=files, data=data, timeout=30)
 
         if r.status_code < 200 or r.status_code >= 300:
+            log.error("wa_media_http_%s: %s", r.status_code, _short(r.text))
             return None, f"WhatsApp media upload error ({r.status_code}). {_short(r.text)}"
 
         media_id = (r.json() or {}).get("id")
         if not media_id:
+            log.error("wa_media_no_id: %s", _short(r.text))
             return None, "WhatsApp media upload returned no media id."
         return media_id, None
 
@@ -200,16 +216,10 @@ def send_generated_image(to: str, prompt: str):
     if err:
         send_text(to, err)
         return
-    if not image_bytes:
-        send_text(to, "Image generation failed.")
-        return
 
     media_id, up_err = wa_upload_media(image_bytes)
     if up_err:
         send_text(to, up_err)
-        return
-    if not media_id:
-        send_text(to, "Image upload failed.")
         return
 
     _wa_send(
@@ -222,14 +232,9 @@ def send_generated_image(to: str, prompt: str):
     )
 
 
-# ------------------ GEMINI HELPERS ------------------
+# ------------------ GEMINI ------------------
 def _call_gemini_with_retries(history: List[Dict[str, Any]], prompt: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Returns (text, err_code)
-    err_code: "RATE_LIMIT" | "OTHER"
-    """
-    last_err = None
-    last_err_text = ""
+    last_msg = ""
     for attempt in range(1, GEMINI_MAX_RETRIES + 1):
         try:
             chat = model.start_chat(history=history)
@@ -237,24 +242,19 @@ def _call_gemini_with_retries(history: List[Dict[str, Any]], prompt: str) -> Tup
             text = (resp.text or "").strip()
             return (text if text else "..."), None
         except Exception as e:
-            last_err = e
-            # Try to detect 429/503-ish situations from exception string (keeps deps minimal)
-            msg = str(e).lower()
-            last_err_text = msg
-            is_rate = ("429" in msg) or ("rate" in msg) or ("quota" in msg) or ("resource_exhausted" in msg)
-            is_busy = ("503" in msg) or ("unavailable" in msg) or ("timeout" in msg)
+            last_msg = str(e).lower()
+            is_rate = ("429" in last_msg) or ("rate" in last_msg) or ("quota" in last_msg) or ("resource_exhausted" in last_msg)
+            is_busy = ("503" in last_msg) or ("unavailable" in last_msg) or ("timeout" in last_msg)
 
-            # exponential backoff with a bit of extra time for rate/busy
+            log.warning("gemini_attempt_%s_failed: %s", attempt, type(e).__name__)
+
             sleep_s = GEMINI_RETRY_BASE_SLEEP * (2 ** (attempt - 1))
             if is_rate or is_busy:
                 sleep_s += 0.6
             time.sleep(sleep_s)
 
-    # classify
-    if ("429" in last_err_text) or ("rate" in last_err_text) or ("quota" in last_err_text) or ("resource_exhausted" in last_err_text):
+    if ("429" in last_msg) or ("rate" in last_msg) or ("quota" in last_msg) or ("resource_exhausted" in last_msg):
         return None, "RATE_LIMIT"
-
-    log.error("gemini_failed: %s", type(last_err).__name__ if last_err else "Unknown")
     return None, "OTHER"
 
 
@@ -281,20 +281,16 @@ def _summarize_fold(existing_summary: str, new_msgs: List[Dict[str, Any]]) -> Op
     transcript = _format_msgs_for_summary(new_msgs)
 
     prompt = (
-        "You maintain a rolling conversation memory.\n"
-        "Update the existing summary by incorporating the NEW TRANSCRIPT.\n\n"
-        "Rules:\n"
-        "- Keep it concise and information-dense.\n"
-        "- Preserve user preferences, goals, decisions, and important facts.\n"
-        "- Do NOT include phone numbers or identifiers.\n"
-        "- Do NOT quote long passages.\n"
-        "- Output ONLY the updated summary text.\n\n"
+        "Update the rolling conversation summary using NEW TRANSCRIPT.\n"
+        "Rules: concise, info-dense, preserve decisions/preferences; no identifiers; no long quotes.\n"
+        "Output ONLY updated summary.\n\n"
         f"EXISTING SUMMARY:\n{(existing_summary or '').strip()}\n\n"
         f"NEW TRANSCRIPT:\n{transcript}\n"
     )
 
     text, err = _call_gemini_with_retries(history=[], prompt=prompt)
     if not text:
+        log.warning("summary_failed: %s", err or "UNKNOWN")
         return None
 
     text = text.strip()
@@ -304,10 +300,6 @@ def _summarize_fold(existing_summary: str, new_msgs: List[Dict[str, Any]]) -> Op
 
 
 def _maybe_update_summary(uid: str, doc: Dict[str, Any]) -> Tuple[str, int]:
-    """
-    Summarize older messages (excluding the last CONTEXT_TURNS) into doc.summary.
-    Uses summarized_upto pointer so each message is summarized once.
-    """
     history = doc.get("history", [])
     if not isinstance(history, list):
         history = []
@@ -325,7 +317,7 @@ def _maybe_update_summary(uid: str, doc: Dict[str, Any]) -> Tuple[str, int]:
         return summary, summarized_upto
 
     tail_start = max(0, total - CONTEXT_TURNS)
-    eligible_end = tail_start  # only summarize before this
+    eligible_end = tail_start
 
     if summarized_upto >= eligible_end:
         return summary, summarized_upto
@@ -342,20 +334,16 @@ def _maybe_update_summary(uid: str, doc: Dict[str, Any]) -> Tuple[str, int]:
         return summary, summarized_upto
 
     try:
-        users.update_one(
-            {"_id": uid},
-            {"$set": {"summary": updated, "summarized_upto": chunk_end}},
-            upsert=True,
-        )
+        users.update_one({"_id": uid}, {"$set": {"summary": updated, "summarized_upto": chunk_end}}, upsert=True)
+        log.info("summary_updated: chunk_end=%s", chunk_end)
         return updated, chunk_end
     except Exception as e:
-        log.error("summary_update_failed: %s", type(e).__name__)
+        log.error("summary_update_db_failed: %s", type(e).__name__)
         return summary, summarized_upto
 
 
 def _build_gemini_history(summary: str, tail: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-
     if summary and summary.strip():
         out.append({"role": "user", "parts": [f"Conversation summary (context only):\n{summary.strip()}"]})
         out.append({"role": "model", "parts": ["Understood."]})
@@ -367,7 +355,6 @@ def _build_gemini_history(summary: str, tail: List[Dict[str, Any]]) -> List[Dict
         t = m.get("t")
         if r in ("user", "model") and isinstance(t, str) and t.strip():
             out.append({"role": r, "parts": [t]})
-
     return out
 
 
@@ -389,7 +376,6 @@ def get_chat_response(uid: str, prompt: str) -> str:
                 return "I’m getting rate-limited right now. Try again in a minute."
             return GEMINI_FAIL_MESSAGE
 
-        # store unlimited history
         users.update_one(
             {"_id": uid},
             {"$push": {"history": {"$each": [{"r": "user", "t": prompt}, {"r": "model", "t": text}]}}},
@@ -436,7 +422,6 @@ def inbound():
             for change in entry.get("changes", []):
                 val = change.get("value", {})
 
-                # ignore status updates
                 if "statuses" in val:
                     continue
 
@@ -451,14 +436,15 @@ def inbound():
 
                     doc = users.find_one({"_id": sender}, {"mode": 1}) or {}
 
-                    # button reply
                     if msg.get("type") == "interactive":
                         try:
                             bid = msg["interactive"]["button_reply"]["id"]
                             mode = "img" if bid == "IMG_MODE" else "chat"
                             users.update_one({"_id": sender}, {"$set": {"mode": mode}}, upsert=True)
                             send_text(sender, f"Mode set to {mode}.")
-                        except Exception:
+                            log.info("mode_set: %s", mode)
+                        except Exception as e:
+                            log.error("button_parse_failed: %s", type(e).__name__)
                             send_text(sender, "Could not read button reply.")
                         continue
 
@@ -469,14 +455,13 @@ def inbound():
                     if not txt:
                         continue
 
-                    # first message: show buttons once
                     if "mode" not in doc:
                         send_mode_buttons(sender)
+                        log.info("sent_mode_buttons")
                         continue
 
                     low = txt.lower()
 
-                    # commands
                     if low.startswith("/imggen"):
                         prompt = txt[7:].strip()
                         if not prompt:
@@ -490,6 +475,7 @@ def inbound():
                         if arg in ("chat", "img"):
                             users.update_one({"_id": sender}, {"$set": {"mode": arg}}, upsert=True)
                             send_text(sender, f"Mode set to {arg}.")
+                            log.info("mode_set: %s", arg)
                         else:
                             send_text(sender, "Usage: /mode chat  OR  /mode img")
                         continue
@@ -497,14 +483,13 @@ def inbound():
                     if low == "/reset":
                         users.delete_one({"_id": sender})
                         send_text(sender, "memory wiped from db")
+                        log.info("memory_reset")
                         continue
 
-                    # auto-detect image requests even in chat mode
                     if looks_like_image_request(txt):
                         send_generated_image(sender, txt)
                         continue
 
-                    # mode behavior
                     if doc.get("mode") == "img":
                         send_generated_image(sender, txt)
                         continue
