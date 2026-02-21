@@ -48,39 +48,32 @@ CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID")
 
 MONGO_URI = os.getenv("MONGO_URI")
 
-# WhatsApp webhook dedupe
+# dedupe
 DEDUP_TTL_HOURS = int(os.getenv("DEDUP_TTL_HOURS", "48"))
 
-# Gemini robustness
-GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "4"))
+# Gemini
+CONTEXT_TURNS = int(os.getenv("CONTEXT_TURNS", "8"))
+
+# IMPORTANT: when quota is exhausted, retries are pointless
+GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
 GEMINI_RETRY_BASE_SLEEP = float(os.getenv("GEMINI_RETRY_BASE_SLEEP", "1.0"))
 
-# If rate-limited, respond with this (instead of "brain error")
 RATE_LIMIT_MESSAGE = os.getenv(
     "RATE_LIMIT_MESSAGE",
-    "I’m getting rate-limited right now. Please try again in ~30 seconds.",
+    "I’m rate-limited right now. Try again in {seconds}s.",
 )
 GENERIC_FAIL_MESSAGE = os.getenv(
     "GEMINI_FAIL_MESSAGE",
     "I’m having trouble right now. Try again in a moment.",
 )
 
-# Context management (Mongo unlimited, Gemini context bounded)
-CONTEXT_TURNS = int(os.getenv("CONTEXT_TURNS", "10"))
+# Circuit breaker (global)
+CB_BASE_COOLDOWN = int(os.getenv("CB_BASE_COOLDOWN", "60"))     # seconds
+CB_MAX_COOLDOWN = int(os.getenv("CB_MAX_COOLDOWN", "600"))      # 10 min max
+CB_BACKOFF_FACTOR = float(os.getenv("CB_BACKOFF_FACTOR", "2.0"))  # exponential growth
 
-# Summary: IMPORTANT to avoid doubling Gemini calls
-# Summarize only rarely and only when NOT rate-limited.
-SUMMARIZE_MIN_NEW = int(os.getenv("SUMMARIZE_MIN_NEW", "40"))
-SUMMARIZE_MAX_CHUNK = int(os.getenv("SUMMARIZE_MAX_CHUNK", "60"))
-SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "3500"))
-SUMMARY_COOLDOWN_SECONDS = int(os.getenv("SUMMARY_COOLDOWN_SECONDS", "180"))  # 3 min
-
-# Per-user cooldown to prevent spam
+# Per-user cooldown (spam guard)
 USER_COOLDOWN_SECONDS = float(os.getenv("USER_COOLDOWN_SECONDS", "2.0"))
-
-# Global rate limiter (token bucket)
-GLOBAL_QPS = float(os.getenv("GLOBAL_QPS", "0.8"))      # tokens per second
-GLOBAL_BURST = float(os.getenv("GLOBAL_BURST", "2.0"))  # max bucket size
 
 # Workers AI image model
 CF_IMAGE_MODEL = os.getenv("CF_IMAGE_MODEL", "@cf/stabilityai/stable-diffusion-xl-base-1.0")
@@ -89,16 +82,12 @@ CF_IMAGE_MODEL = os.getenv("CF_IMAGE_MODEL", "@cf/stabilityai/stable-diffusion-x
 http = requests.Session()
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("models/gemini-2.5-flash")
+model = genai.GenerativeModel("models/gemini-1.5-flash")
 
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client.whatsapp_bot
 
-# users doc:
-# { _id, mode, history:[{r,t}...], summary, summarized_upto, last_summary_at, last_user_at }
 users = db.chats
-
-# dedupe doc:
 processed = db.wa_processed_message_ids
 
 
@@ -113,26 +102,39 @@ def _safe_indexes():
 _safe_indexes()
 
 
-# ------------------ GLOBAL TOKEN BUCKET ------------------
-_bucket_tokens = GLOBAL_BURST
-_bucket_last = time.time()
+# ------------------ CIRCUIT BREAKER STATE ------------------
+_cb_until = 0.0
+_cb_cooldown = float(CB_BASE_COOLDOWN)
 
 
-def _global_allow() -> bool:
+def _cb_is_open() -> bool:
+    return time.time() < _cb_until
+
+
+def _cb_remaining() -> int:
+    rem = int(_cb_until - time.time())
+    return rem if rem > 0 else 0
+
+
+def _cb_trip():
     """
-    Simple global QPS limiter to reduce Gemini rate limit hits.
+    Open circuit for _cb_cooldown seconds, and increase cooldown for next time.
     """
-    global _bucket_tokens, _bucket_last
+    global _cb_until, _cb_cooldown
     now = time.time()
-    elapsed = now - _bucket_last
-    _bucket_last = now
+    _cb_until = now + _cb_cooldown
+    log.warning("circuit_breaker_open: %ss", int(_cb_cooldown))
 
-    _bucket_tokens = min(GLOBAL_BURST, _bucket_tokens + elapsed * GLOBAL_QPS)
+    # exponential backoff, capped
+    _cb_cooldown = min(float(CB_MAX_COOLDOWN), _cb_cooldown * CB_BACKOFF_FACTOR)
 
-    if _bucket_tokens >= 1.0:
-        _bucket_tokens -= 1.0
-        return True
-    return False
+
+def _cb_reset():
+    """
+    If calls succeed, slowly reset cooldown to base.
+    """
+    global _cb_cooldown
+    _cb_cooldown = max(float(CB_BASE_COOLDOWN), _cb_cooldown / CB_BACKOFF_FACTOR)
 
 
 # ------------------ UTILS ------------------
@@ -274,32 +276,43 @@ def send_generated_image(to: str, prompt: str):
 
 
 # ------------------ GEMINI ------------------
-def _call_gemini_with_retries(history: List[Dict[str, Any]], prompt: str) -> Tuple[Optional[str], Optional[str]]:
+def _looks_rate_limited(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "resourceexhausted" in msg
+        or "quota" in msg
+        or "rate" in msg
+        or "429" in msg
+        or "resource_exhausted" in msg
+    )
+
+
+def _call_gemini(history: List[Dict[str, Any]], prompt: str) -> Tuple[Optional[str], Optional[str]]:
     """
     Returns (text, err_code) where err_code is RATE_LIMIT or OTHER.
-    Applies global limiter first.
+    Implements circuit breaker:
+      - If circuit is open: don't call Gemini.
+      - If ResourceExhausted: trip circuit immediately (no extra retries).
     """
-    if not _global_allow():
-        log.warning("global_rate_limiter_block")
+    if _cb_is_open():
         return None, "RATE_LIMIT"
 
-    last_msg = ""
     for attempt in range(1, GEMINI_MAX_RETRIES + 1):
         try:
             chat = model.start_chat(history=history)
             resp = chat.send_message(prompt)
-            text = (resp.text or "").strip()
-            return (text if text else "..."), None
+            text = (resp.text or "").strip() or "..."
+            _cb_reset()
+            return text, None
+
         except Exception as e:
-            last_msg = str(e).lower()
+            if _looks_rate_limited(e):
+                log.warning("gemini_rate_limited: %s", type(e).__name__)
+                _cb_trip()
+                return None, "RATE_LIMIT"
+
             log.warning("gemini_attempt_%s_failed: %s", attempt, type(e).__name__)
-
-            sleep_s = GEMINI_RETRY_BASE_SLEEP * (2 ** (attempt - 1))
-            # slightly longer waits help with quota/rate bursts
-            time.sleep(sleep_s)
-
-    if ("resourceexhausted" in last_msg) or ("429" in last_msg) or ("rate" in last_msg) or ("quota" in last_msg):
-        return None, "RATE_LIMIT"
+            time.sleep(GEMINI_RETRY_BASE_SLEEP * (2 ** (attempt - 1)))
 
     return None, "OTHER"
 
@@ -319,124 +332,12 @@ def _build_gemini_history(summary: str, tail: List[Dict[str, Any]]) -> List[Dict
     return out
 
 
-def _format_msgs_for_summary(msgs: List[Dict[str, Any]], max_chars: int = 12000) -> str:
-    lines = []
-    total = 0
-    for m in msgs:
-        if not isinstance(m, dict):
-            continue
-        r = m.get("r")
-        t = m.get("t")
-        if r not in ("user", "model") or not isinstance(t, str):
-            continue
-        prefix = "USER" if r == "user" else "ASSISTANT"
-        chunk = f"{prefix}: {t.strip()}\n"
-        if total + len(chunk) > max_chars:
-            break
-        lines.append(chunk)
-        total += len(chunk)
-    return "".join(lines)
-
-
-def _summarize_fold(existing_summary: str, new_msgs: List[Dict[str, Any]]) -> Optional[str]:
-    transcript = _format_msgs_for_summary(new_msgs)
-    prompt = (
-        "Update the rolling conversation summary using NEW TRANSCRIPT.\n"
-        "Rules: concise; preserve decisions/preferences; no identifiers; no long quotes.\n"
-        "Output ONLY updated summary.\n\n"
-        f"EXISTING SUMMARY:\n{(existing_summary or '').strip()}\n\n"
-        f"NEW TRANSCRIPT:\n{transcript}\n"
-    )
-    text, err = _call_gemini_with_retries(history=[], prompt=prompt)
-    if not text:
-        log.warning("summary_failed: %s", err or "UNKNOWN")
-        return None
-
-    text = text.strip()
-    if len(text) > SUMMARY_MAX_CHARS:
-        text = text[:SUMMARY_MAX_CHARS].rstrip() + "…"
-    return text
-
-
-def _maybe_update_summary(uid: str, doc: Dict[str, Any], skip_if_rate_limited: bool) -> Tuple[str, int]:
-    """
-    Summarize older messages occasionally.
-    If we are rate-limited (or recently rate-limited), SKIP summarization to avoid extra Gemini calls.
-    """
-    history = doc.get("history", [])
-    if not isinstance(history, list):
-        history = []
-
-    summary = doc.get("summary", "")
-    if not isinstance(summary, str):
-        summary = ""
-
-    summarized_upto = doc.get("summarized_upto", 0)
-    if not isinstance(summarized_upto, int) or summarized_upto < 0:
-        summarized_upto = 0
-
-    last_summary_at = doc.get("last_summary_at", 0)
-    if not isinstance(last_summary_at, (int, float)):
-        last_summary_at = 0
-
-    # cooldown to avoid frequent summary updates
-    now = time.time()
-    if (now - last_summary_at) < SUMMARY_COOLDOWN_SECONDS:
-        return summary, summarized_upto
-
-    if skip_if_rate_limited:
-        return summary, summarized_upto
-
-    total = len(history)
-    if total <= CONTEXT_TURNS:
-        return summary, summarized_upto
-
-    tail_start = max(0, total - CONTEXT_TURNS)
-    eligible_end = tail_start
-
-    if summarized_upto >= eligible_end:
-        return summary, summarized_upto
-
-    new_count = eligible_end - summarized_upto
-    if new_count < SUMMARIZE_MIN_NEW:
-        return summary, summarized_upto
-
-    chunk_end = min(eligible_end, summarized_upto + SUMMARIZE_MAX_CHUNK)
-    chunk = history[summarized_upto:chunk_end]
-
-    updated = _summarize_fold(summary, chunk)
-    if not updated:
-        return summary, summarized_upto
-
-    try:
-        users.update_one(
-            {"_id": uid},
-            {"$set": {"summary": updated, "summarized_upto": chunk_end, "last_summary_at": now}},
-            upsert=True,
-        )
-        log.info("summary_updated: chunk_end=%s", chunk_end)
-        return updated, chunk_end
-    except Exception as e:
-        log.error("summary_update_db_failed: %s", type(e).__name__)
-        return summary, summarized_upto
-
-
 def get_chat_response(uid: str, prompt: str) -> str:
-    """
-    NOTE: This is designed to minimize Gemini calls:
-    - We do NOT summarize if we've been rate-limited recently.
-    - We only summarize occasionally (cooldown + min new).
-    """
     try:
-        doc = users.find_one(
-            {"_id": uid},
-            {"history": 1, "summary": 1, "summarized_upto": 1, "last_summary_at": 1},
-        ) or {}
-
+        doc = users.find_one({"_id": uid}, {"history": 1, "summary": 1}) or {}
         history = doc.get("history", [])
         if not isinstance(history, list):
             history = []
-
         summary = doc.get("summary", "")
         if not isinstance(summary, str):
             summary = ""
@@ -444,32 +345,17 @@ def get_chat_response(uid: str, prompt: str) -> str:
         tail = history[-CONTEXT_TURNS:] if CONTEXT_TURNS > 0 else []
         gemini_hist = _build_gemini_history(summary, tail)
 
-        text, err = _call_gemini_with_retries(gemini_hist, prompt)
+        text, err = _call_gemini(gemini_hist, prompt)
         if not text:
-            # If rate-limited, DO NOT attempt summarization (avoid second call).
             if err == "RATE_LIMIT":
-                # mark timestamp so we can skip summary for a bit (optional)
-                users.update_one({"_id": uid}, {"$set": {"last_rate_limit_at": time.time()}}, upsert=True)
-                return RATE_LIMIT_MESSAGE
+                return RATE_LIMIT_MESSAGE.format(seconds=_cb_remaining() or 30)
             return GENERIC_FAIL_MESSAGE
 
-        # store unlimited history
         users.update_one(
             {"_id": uid},
             {"$push": {"history": {"$each": [{"r": "user", "t": prompt}, {"r": "model", "t": text}]}}},
             upsert=True,
         )
-
-        # After a successful reply, we MAY update summary (rarely), but only if not rate-limited.
-        # Also: this runs after reply so user doesn't feel latency.
-        doc2 = users.find_one(
-            {"_id": uid},
-            {"history": 1, "summary": 1, "summarized_upto": 1, "last_summary_at": 1, "last_rate_limit_at": 1},
-        ) or {}
-        last_rl = doc2.get("last_rate_limit_at", 0)
-        skip_summary = isinstance(last_rl, (int, float)) and (time.time() - last_rl) < 120  # 2 min
-        _maybe_update_summary(uid, doc2, skip_if_rate_limited=skip_summary)
-
         return text
 
     except Exception as e:
@@ -523,15 +409,13 @@ def inbound():
                     if not sender:
                         continue
 
-                    # per-user cooldown (prevents spamming Gemini)
+                    # per-user cooldown
                     now = time.time()
                     doc = users.find_one({"_id": sender}, {"mode": 1, "last_user_at": 1}) or {}
                     last_user_at = doc.get("last_user_at", 0)
                     if isinstance(last_user_at, (int, float)) and (now - last_user_at) < USER_COOLDOWN_SECONDS:
-                        # Don't reply to rapid-fire messages; avoids hammering Gemini
                         log.info("user_cooldown_skip")
                         continue
-
                     users.update_one({"_id": sender}, {"$set": {"last_user_at": now}}, upsert=True)
 
                     # button reply
@@ -554,7 +438,7 @@ def inbound():
                     if not txt:
                         continue
 
-                    # first message: show buttons once
+                    # first message => show buttons
                     if "mode" not in doc:
                         send_mode_buttons(sender)
                         log.info("sent_mode_buttons")
@@ -562,7 +446,6 @@ def inbound():
 
                     low = txt.lower()
 
-                    # commands
                     if low.startswith("/imggen"):
                         prompt = txt[7:].strip()
                         if not prompt:
@@ -587,7 +470,7 @@ def inbound():
                         log.info("memory_reset")
                         continue
 
-                    # auto-detect image requests even in chat mode
+                    # image detection override
                     if looks_like_image_request(txt):
                         send_generated_image(sender, txt)
                         continue
