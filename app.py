@@ -1,6 +1,7 @@
 import os
 import logging
 import time
+import base64
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -48,13 +49,11 @@ CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID")
 
 MONGO_URI = os.getenv("MONGO_URI")
 
-# dedupe
 DEDUP_TTL_HOURS = int(os.getenv("DEDUP_TTL_HOURS", "48"))
 
-# Gemini
 CONTEXT_TURNS = int(os.getenv("CONTEXT_TURNS", "8"))
 
-# IMPORTANT: when quota is exhausted, retries are pointless
+# Gemini retries (but circuit breaker stops hammering when exhausted)
 GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
 GEMINI_RETRY_BASE_SLEEP = float(os.getenv("GEMINI_RETRY_BASE_SLEEP", "1.0"))
 
@@ -68,11 +67,11 @@ GENERIC_FAIL_MESSAGE = os.getenv(
 )
 
 # Circuit breaker (global)
-CB_BASE_COOLDOWN = int(os.getenv("CB_BASE_COOLDOWN", "60"))     # seconds
-CB_MAX_COOLDOWN = int(os.getenv("CB_MAX_COOLDOWN", "600"))      # 10 min max
-CB_BACKOFF_FACTOR = float(os.getenv("CB_BACKOFF_FACTOR", "2.0"))  # exponential growth
+CB_BASE_COOLDOWN = int(os.getenv("CB_BASE_COOLDOWN", "60"))
+CB_MAX_COOLDOWN = int(os.getenv("CB_MAX_COOLDOWN", "600"))
+CB_BACKOFF_FACTOR = float(os.getenv("CB_BACKOFF_FACTOR", "2.0"))
 
-# Per-user cooldown (spam guard)
+# Per-user cooldown
 USER_COOLDOWN_SECONDS = float(os.getenv("USER_COOLDOWN_SECONDS", "2.0"))
 
 # Workers AI image model
@@ -82,7 +81,7 @@ CF_IMAGE_MODEL = os.getenv("CF_IMAGE_MODEL", "@cf/stabilityai/stable-diffusion-x
 http = requests.Session()
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("models/gemini-1.5-flash")
+model = genai.GenerativeModel("models/gemini-2.5-flash")
 
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client.whatsapp_bot
@@ -117,22 +116,14 @@ def _cb_remaining() -> int:
 
 
 def _cb_trip():
-    """
-    Open circuit for _cb_cooldown seconds, and increase cooldown for next time.
-    """
     global _cb_until, _cb_cooldown
     now = time.time()
     _cb_until = now + _cb_cooldown
     log.warning("circuit_breaker_open: %ss", int(_cb_cooldown))
-
-    # exponential backoff, capped
     _cb_cooldown = min(float(CB_MAX_COOLDOWN), _cb_cooldown * CB_BACKOFF_FACTOR)
 
 
 def _cb_reset():
-    """
-    If calls succeed, slowly reset cooldown to base.
-    """
     global _cb_cooldown
     _cb_cooldown = max(float(CB_BASE_COOLDOWN), _cb_cooldown / CB_BACKOFF_FACTOR)
 
@@ -197,10 +188,16 @@ def send_mode_buttons(to: str):
     )
 
 
-# ------------------ CLOUDFLARE IMAGE GEN ------------------
-def cf_generate_image(prompt: str) -> Tuple[Optional[bytes], Optional[str]]:
+# ------------------ CLOUDFLARE IMAGE GEN (binary OR JSON base64) ------------------
+def cf_generate_image(prompt: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+    """
+    Returns (image_bytes, mime_type, error_text).
+    Supports two Cloudflare response formats:
+      1) Binary image with content-type image/*
+      2) JSON { result: { image: "<base64>" } } (often JPEG base64)
+    """
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
-        return None, "Cloudflare not configured (missing CF_ACCOUNT_ID/CF_API_TOKEN)."
+        return None, None, "Cloudflare not configured (missing CF_ACCOUNT_ID/CF_API_TOKEN)."
 
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_IMAGE_MODEL}"
 
@@ -214,21 +211,38 @@ def cf_generate_image(prompt: str) -> Tuple[Optional[bytes], Optional[str]]:
 
         if r.status_code < 200 or r.status_code >= 300:
             log.error("cf_img_http_%s: %s", r.status_code, _short(r.text))
-            return None, f"Cloudflare AI error ({r.status_code}). {_short(r.text)}"
+            return None, None, f"Cloudflare AI error ({r.status_code}). {_short(r.text)}"
 
         ctype = (r.headers.get("content-type") or "").lower()
-        if "image/" in ctype:
-            return r.content, None
 
+        # 1) Binary image
+        if "image/" in ctype:
+            return r.content, ctype.split(";")[0], None
+
+        # 2) JSON base64 image
+        if "application/json" in ctype:
+            try:
+                data = r.json()
+                b64 = (data.get("result") or {}).get("image")
+                if isinstance(b64, str) and b64:
+                    # Workers AI tends to return JPEG base64 (your /9j/ prefix is JPEG)
+                    img_bytes = base64.b64decode(b64)
+                    return img_bytes, "image/jpeg", None
+                # Sometimes other keys appear; show a short diagnostic
+                return None, None, f"Cloudflare AI returned JSON but no result.image field. {_short(r.text)}"
+            except Exception:
+                return None, None, f"Cloudflare AI returned JSON but could not parse it. {_short(r.text)}"
+
+        # Unexpected
         log.error("cf_img_unexpected_ctype: %s body=%s", ctype, _short(r.text))
-        return None, f"Cloudflare AI returned unexpected response. {ctype}"
+        return None, None, f"Cloudflare AI returned unexpected content-type: {ctype}"
 
     except requests.exceptions.Timeout:
         log.error("cf_img_timeout")
-        return None, "Cloudflare AI timed out."
+        return None, None, "Cloudflare AI timed out."
     except Exception as e:
         log.error("cf_img_failed: %s", type(e).__name__)
-        return None, "Cloudflare AI request failed."
+        return None, None, "Cloudflare AI request failed."
 
 
 def wa_upload_media(image_bytes: bytes, mime_type: str = "image/jpeg") -> Tuple[Optional[str], Optional[str]]:
@@ -255,12 +269,15 @@ def wa_upload_media(image_bytes: bytes, mime_type: str = "image/jpeg") -> Tuple[
 
 
 def send_generated_image(to: str, prompt: str):
-    image_bytes, err = cf_generate_image(prompt)
+    img_bytes, mime, err = cf_generate_image(prompt)
     if err:
         send_text(to, err)
         return
+    if not img_bytes:
+        send_text(to, "Image generation failed.")
+        return
 
-    media_id, up_err = wa_upload_media(image_bytes)
+    media_id, up_err = wa_upload_media(img_bytes, mime_type=mime or "image/jpeg")
     if up_err:
         send_text(to, up_err)
         return
@@ -280,20 +297,14 @@ def _looks_rate_limited(exc: Exception) -> bool:
     msg = str(exc).lower()
     return (
         "resourceexhausted" in msg
+        or "resource_exhausted" in msg
         or "quota" in msg
         or "rate" in msg
         or "429" in msg
-        or "resource_exhausted" in msg
     )
 
 
 def _call_gemini(history: List[Dict[str, Any]], prompt: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Returns (text, err_code) where err_code is RATE_LIMIT or OTHER.
-    Implements circuit breaker:
-      - If circuit is open: don't call Gemini.
-      - If ResourceExhausted: trip circuit immediately (no extra retries).
-    """
     if _cb_is_open():
         return None, "RATE_LIMIT"
 
@@ -304,7 +315,6 @@ def _call_gemini(history: List[Dict[str, Any]], prompt: str) -> Tuple[Optional[s
             text = (resp.text or "").strip() or "..."
             _cb_reset()
             return text, None
-
         except Exception as e:
             if _looks_rate_limited(e):
                 log.warning("gemini_rate_limited: %s", type(e).__name__)
@@ -317,11 +327,8 @@ def _call_gemini(history: List[Dict[str, Any]], prompt: str) -> Tuple[Optional[s
     return None, "OTHER"
 
 
-def _build_gemini_history(summary: str, tail: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _build_gemini_history(tail: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    if summary and summary.strip():
-        out.append({"role": "user", "parts": [f"Conversation summary (context only):\n{summary.strip()}"]})
-        out.append({"role": "model", "parts": ["Understood."]})
     for m in tail:
         if not isinstance(m, dict):
             continue
@@ -334,16 +341,13 @@ def _build_gemini_history(summary: str, tail: List[Dict[str, Any]]) -> List[Dict
 
 def get_chat_response(uid: str, prompt: str) -> str:
     try:
-        doc = users.find_one({"_id": uid}, {"history": 1, "summary": 1}) or {}
+        doc = users.find_one({"_id": uid}, {"history": 1}) or {}
         history = doc.get("history", [])
         if not isinstance(history, list):
             history = []
-        summary = doc.get("summary", "")
-        if not isinstance(summary, str):
-            summary = ""
 
         tail = history[-CONTEXT_TURNS:] if CONTEXT_TURNS > 0 else []
-        gemini_hist = _build_gemini_history(summary, tail)
+        gemini_hist = _build_gemini_history(tail)
 
         text, err = _call_gemini(gemini_hist, prompt)
         if not text:
@@ -409,7 +413,6 @@ def inbound():
                     if not sender:
                         continue
 
-                    # per-user cooldown
                     now = time.time()
                     doc = users.find_one({"_id": sender}, {"mode": 1, "last_user_at": 1}) or {}
                     last_user_at = doc.get("last_user_at", 0)
@@ -418,16 +421,13 @@ def inbound():
                         continue
                     users.update_one({"_id": sender}, {"$set": {"last_user_at": now}}, upsert=True)
 
-                    # button reply
                     if msg.get("type") == "interactive":
                         try:
                             bid = msg["interactive"]["button_reply"]["id"]
                             mode = "img" if bid == "IMG_MODE" else "chat"
                             users.update_one({"_id": sender}, {"$set": {"mode": mode}}, upsert=True)
                             send_text(sender, f"Mode set to {mode}.")
-                            log.info("mode_set: %s", mode)
-                        except Exception as e:
-                            log.error("button_parse_failed: %s", type(e).__name__)
+                        except Exception:
                             send_text(sender, "Could not read button reply.")
                         continue
 
@@ -438,10 +438,8 @@ def inbound():
                     if not txt:
                         continue
 
-                    # first message => show buttons
                     if "mode" not in doc:
                         send_mode_buttons(sender)
-                        log.info("sent_mode_buttons")
                         continue
 
                     low = txt.lower()
@@ -459,7 +457,6 @@ def inbound():
                         if arg in ("chat", "img"):
                             users.update_one({"_id": sender}, {"$set": {"mode": arg}}, upsert=True)
                             send_text(sender, f"Mode set to {arg}.")
-                            log.info("mode_set: %s", arg)
                         else:
                             send_text(sender, "Usage: /mode chat  OR  /mode img")
                         continue
@@ -467,15 +464,12 @@ def inbound():
                     if low == "/reset":
                         users.delete_one({"_id": sender})
                         send_text(sender, "memory wiped from db")
-                        log.info("memory_reset")
                         continue
 
-                    # image detection override
                     if looks_like_image_request(txt):
                         send_generated_image(sender, txt)
                         continue
 
-                    # mode behavior
                     if doc.get("mode") == "img":
                         send_generated_image(sender, txt)
                         continue
