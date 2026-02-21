@@ -2,7 +2,7 @@ import os
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
 import requests
 from flask import Flask, request, jsonify
@@ -16,39 +16,33 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# --- logging (NO message contents / NO phone numbers) ---
-LOG_LEVEL = os.getenv("LOG_LEVEL", "ERROR").upper()  # ERROR by default
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.ERROR))
+# ------------------ LOGGING ------------------
+logging.basicConfig(level=logging.ERROR)
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
 log = logging.getLogger("wa-bot")
 
-# Silence Werkzeug request logs
-logging.getLogger("werkzeug").setLevel(logging.ERROR)
-
-# config
+# ------------------ CONFIG ------------------
 WA_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY = os.getenv("VERIFY_TOKEN")
-API_KEY = os.getenv("GEMINI_API_KEY")
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+CF_API_TOKEN = os.getenv("CF_API_TOKEN")
+CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID")
+
 MONGO_URI = os.getenv("MONGO_URI")
 
-DEDUP_TTL_HOURS = int(os.getenv("DEDUP_TTL_HOURS", "48"))
+DEDUP_TTL_HOURS = 48
+CONTEXT_TURNS = 12
+FAIL_MESSAGE = "brain error"
 
-# Gemini robustness knobs
-GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
-GEMINI_RETRY_BASE_SLEEP = float(os.getenv("GEMINI_RETRY_BASE_SLEEP", "0.8"))  # seconds
-GEMINI_TIMEOUT_NOTE = os.getenv(
-    "GEMINI_FAIL_MESSAGE",
-    "brain error",
-)
-
-# HTTP session reuse
+# ------------------ SETUP ------------------
 http = requests.Session()
 
-# setup gemini
-genai.configure(api_key=API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("models/gemini-2.5-flash")
 
-# setup mongo (TLS fix for Linux)
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client.whatsapp_bot
 
@@ -56,11 +50,7 @@ users = db.chats
 processed = db.wa_processed_message_ids
 
 
-def _safe_create_indexes() -> None:
-    """
-    Create only needed indexes.
-    Never create _id index manually (Mongo already has it).
-    """
+def _safe_indexes():
     try:
         processed.create_index(
             [("expiresAt", ASCENDING)],
@@ -68,130 +58,198 @@ def _safe_create_indexes() -> None:
             name="expiresAt_ttl",
         )
     except OperationFailure:
-        # If index create is not permitted, proceed anyway.
         pass
 
+_safe_indexes()
 
-_safe_create_indexes()
 
-
-def _mark_processed_once(message_id: Optional[str]) -> bool:
-    """
-    Returns True if new -> process it.
-    False if duplicate webhook / retry of same message.
-    """
-    if not message_id:
+# ------------------ DEDUPE ------------------
+def _mark_processed_once(mid: Optional[str]) -> bool:
+    if not mid:
         return True
-
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=DEDUP_TTL_HOURS)
     try:
-        processed.insert_one({"_id": message_id, "expiresAt": expires_at})
+        processed.insert_one({
+            "_id": mid,
+            "expiresAt": datetime.now(timezone.utc) + timedelta(hours=DEDUP_TTL_HOURS)
+        })
         return True
     except DuplicateKeyError:
         return False
     except OperationFailure:
-        # If DB insert fails transiently, don't block processing.
         return True
 
 
-def _wa_send_text(to: str, body: str) -> None:
-    url = f"https://graph.facebook.com/v21.0/{PHONE_ID}/messages"
+# ------------------ WHATSAPP SEND ------------------
+def _wa_send(payload: Dict[str, Any]) -> None:
     try:
         http.post(
-            url,
+            f"https://graph.facebook.com/v21.0/{PHONE_ID}/messages",
             headers={
                 "Authorization": f"Bearer {WA_TOKEN}",
                 "Content-Type": "application/json",
             },
-            json={
-                "messaging_product": "whatsapp",
-                "to": to,
-                "type": "text",
-                "text": {"body": body},
-            },
-            timeout=12,
+            json=payload,
+            timeout=20,
         )
     except Exception as e:
-        # No sensitive info; ok to log the exception type only
-        log.error("wa_send_text_failed: %s", type(e).__name__)
+        log.error("wa_send_failed: %s", type(e).__name__)
 
 
-def _build_gemini_history(raw_hist) -> list:
-    """
-    Convert compact history [{r,t},...] to Gemini format, skipping malformed entries.
-    """
-    out = []
-    if not isinstance(raw_hist, list):
-        return out
-    for m in raw_hist:
-        if not isinstance(m, dict):
-            continue
-        r = m.get("r")
-        t = m.get("t")
-        if r in ("user", "model") and isinstance(t, str) and t.strip():
-            out.append({"role": r, "parts": [t]})
-    return out
+def send_text(to: str, body: str):
+    _wa_send({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": body}
+    })
 
 
-def _call_gemini_with_retries(gemini_history: list, prompt: str) -> str:
-    """
-    Retries transient Gemini failures with exponential backoff.
-    """
-    last_err = None
-    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
-        try:
-            chat = model.start_chat(history=gemini_history)
-            resp = chat.send_message(prompt)
-            text = (resp.text or "").strip()
-            return text if text else "..."
-        except Exception as e:
-            last_err = e
-            # backoff
-            sleep_s = GEMINI_RETRY_BASE_SLEEP * (2 ** (attempt - 1))
-            time.sleep(sleep_s)
+def send_mode_buttons(to: str):
+    _wa_send({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": "What do you want to do?"},
+            "action": {
+                "buttons": [
+                    {
+                        "type": "reply",
+                        "reply": {"id": "IMG_MODE", "title": "🖼️ Generate image"}
+                    },
+                    {
+                        "type": "reply",
+                        "reply": {"id": "CHAT_MODE", "title": "💬 Chat with AI"}
+                    }
+                ]
+            }
+        }
+    })
 
-    # After retries, raise last error to be handled by caller
-    raise last_err  # type: ignore[misc]
+
+# ------------------ CLOUDFLARE IMAGE GEN ------------------
+def cf_generate_image(prompt: str) -> Optional[bytes]:
+    try:
+        url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/stabilityai/stable-diffusion-xl-base-1.0"
+
+        r = http.post(
+            url,
+            headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
+            json={"prompt": prompt},
+            timeout=90,
+        )
+
+        r.raise_for_status()
+        return r.content  # raw image bytes
+
+    except Exception as e:
+        log.error("cf_img_failed: %s", type(e).__name__)
+        return None
 
 
-def get_response(uid: str, prompt: str) -> str:
+def wa_upload_media(image_bytes: bytes) -> Optional[str]:
+    try:
+        url = f"https://graph.facebook.com/v21.0/{PHONE_ID}/media"
+
+        files = {
+            "file": ("image.jpg", image_bytes, "image/jpeg"),
+        }
+
+        data = {"messaging_product": "whatsapp"}
+
+        r = http.post(
+            url,
+            headers={"Authorization": f"Bearer {WA_TOKEN}"},
+            files=files,
+            data=data,
+            timeout=30,
+        )
+
+        r.raise_for_status()
+        return r.json().get("id")
+
+    except Exception as e:
+        log.error("wa_upload_failed: %s", type(e).__name__)
+        return None
+
+
+def send_generated_image(to: str, prompt: str):
+    image_bytes = cf_generate_image(prompt)
+    if not image_bytes:
+        send_text(to, "Image generation failed.")
+        return
+
+    media_id = wa_upload_media(image_bytes)
+    if not media_id:
+        send_text(to, "Image upload failed.")
+        return
+
+    _wa_send({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "image",
+        "image": {
+            "id": media_id,
+            "caption": "Generated image"
+        }
+    })
+
+
+# ------------------ GEMINI CHAT ------------------
+def get_chat_response(uid: str, prompt: str) -> str:
     try:
         doc = users.find_one({"_id": uid}, {"history": 1}) or {}
-        raw_hist = doc.get("history", [])
+        history = doc.get("history", [])
 
-        gemini_history = _build_gemini_history(raw_hist)
+        tail = history[-CONTEXT_TURNS:]
 
-        answer = _call_gemini_with_retries(gemini_history, prompt)
+        gemini_hist = [
+            {"role": m["r"], "parts": [m["t"]]}
+            for m in tail if isinstance(m, dict)
+        ]
 
-        # Unlimited history (no cap)
+        chat = model.start_chat(history=gemini_hist)
+        resp = chat.send_message(prompt)
+        answer = (resp.text or "").strip() or "..."
+
         users.update_one(
             {"_id": uid},
-            {
-                "$push": {
-                    "history": {
-                        "$each": [
-                            {"r": "user", "t": prompt},
-                            {"r": "model", "t": answer},
-                        ]
-                    }
-                }
-            },
+            {"$push": {"history": {
+                "$each": [
+                    {"r": "user", "t": prompt},
+                    {"r": "model", "t": answer},
+                ]
+            }}},
             upsert=True,
         )
 
         return answer
 
-    except Exception as e:
-        # Log only exception type (no content / no uid)
-        log.error("get_response_failed: %s", type(e).__name__)
-        return GEMINI_TIMEOUT_NOTE
+    except Exception:
+        return FAIL_MESSAGE
 
 
+# ------------------ IMAGE INTENT DETECTION ------------------
+def looks_like_image_request(text: str) -> bool:
+    t = text.lower()
+    triggers = [
+        "generate image",
+        "create image",
+        "draw",
+        "make an image",
+        "create a picture",
+        "generate a picture"
+    ]
+    return any(x in t for x in triggers)
+
+
+# ------------------ WEBHOOK ------------------
 @app.route("/webhook", methods=["GET"])
-def verify_token():
-    args = request.args
-    if args.get("hub.mode") == "subscribe" and args.get("hub.verify_token") == VERIFY:
-        return args.get("hub.challenge"), 200
+def verify():
+    a = request.args
+    if a.get("hub.mode") == "subscribe" and a.get("hub.verify_token") == VERIFY:
+        return a.get("hub.challenge"), 200
     return "Forbidden", 403
 
 
@@ -204,11 +262,10 @@ def inbound():
             for change in entry.get("changes", []):
                 val = change.get("value", {})
 
-                # Ignore status webhooks
                 if "statuses" in val:
                     continue
 
-                for msg in (val.get("messages") or []):
+                for msg in val.get("messages", []):
                     mid = msg.get("id")
                     if not _mark_processed_once(mid):
                         continue
@@ -217,31 +274,56 @@ def inbound():
                     if not sender:
                         continue
 
+                    doc = users.find_one({"_id": sender}) or {}
+
+                    # -------- BUTTON RESPONSE --------
+                    if msg.get("type") == "interactive":
+                        bid = msg["interactive"]["button_reply"]["id"]
+                        mode = "img" if bid == "IMG_MODE" else "chat"
+                        users.update_one(
+                            {"_id": sender},
+                            {"$set": {"mode": mode}},
+                            upsert=True,
+                        )
+                        send_text(sender, f"Mode set to {mode}.")
+                        continue
+
                     if msg.get("type") != "text":
                         continue
 
-                    txt = (msg.get("text") or {}).get("body", "")
-                    if not txt:
+                    txt = msg["text"]["body"].strip()
+
+                    # -------- FIRST MESSAGE --------
+                    if "mode" not in doc:
+                        send_mode_buttons(sender)
                         continue
 
-                    low = txt.strip().lower()
-
-                    if low == "/reset":
-                        users.delete_one({"_id": sender})
-                        _wa_send_text(sender, "memory wiped from db")
+                    # -------- COMMAND --------
+                    if txt.lower().startswith("/imggen"):
+                        prompt = txt[7:].strip()
+                        if prompt:
+                            send_generated_image(sender, prompt)
+                        else:
+                            send_text(sender, "Usage: /imggen your prompt here")
                         continue
 
-                    if low == "ping":
-                        _wa_send_text(sender, "pong")
+                    # -------- AUTO DETECT IMAGE INTENT --------
+                    if looks_like_image_request(txt):
+                        send_generated_image(sender, txt)
                         continue
 
-                    out = get_response(sender, txt)
-                    _wa_send_text(sender, out)
+                    # -------- IMAGE MODE --------
+                    if doc.get("mode") == "img":
+                        send_generated_image(sender, txt)
+                        continue
+
+                    # -------- CHAT MODE --------
+                    reply = get_chat_response(sender, txt)
+                    send_text(sender, reply)
 
         return jsonify({"status": "ok"}), 200
 
     except Exception as e:
-        # Always 200 to prevent retries; log only exception type
         log.error("webhook_failed: %s", type(e).__name__)
         return jsonify({"status": "ok"}), 200
 
