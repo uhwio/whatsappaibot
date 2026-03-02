@@ -376,7 +376,7 @@ def pollinations_generate_media(
     headers = {"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}
 
     try:
-        r = http.get(url, params=params, headers=headers, timeout=240)
+        r = http.get(url, params=params, headers=headers, timeout=600)
         if r.status_code < 200 or r.status_code >= 300:
             return None, None, f"Pollinations error ({r.status_code}). {_short(r.text)}"
 
