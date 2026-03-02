@@ -200,7 +200,7 @@ def send_mode_buttons(to: str):
 
 
 # ------------------ POLLINATIONS IMAGE GEN ------------------
-ddef pollinations_generate_image(
+def pollinations_generate_image(
     prompt: str,
     model_name: str,
     width: int,
