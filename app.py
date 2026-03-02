@@ -2,6 +2,7 @@ import os
 import logging
 import time
 import base64
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -44,16 +45,21 @@ VERIFY = os.getenv("VERIFY_TOKEN")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-CF_API_TOKEN = os.getenv("CF_API_TOKEN")
-CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID")
-
 MONGO_URI = os.getenv("MONGO_URI")
 
+# Pollinations
+POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY")
+POLLINATIONS_IMAGE_MODEL = os.getenv("POLLINATIONS_IMAGE_MODEL", "flux")
+POLLINATIONS_WIDTH = int(os.getenv("POLLINATIONS_WIDTH", "1024"))
+POLLINATIONS_HEIGHT = int(os.getenv("POLLINATIONS_HEIGHT", "1024"))
+
+# dedupe
 DEDUP_TTL_HOURS = int(os.getenv("DEDUP_TTL_HOURS", "48"))
 
+# Gemini
 CONTEXT_TURNS = int(os.getenv("CONTEXT_TURNS", "8"))
 
-# Gemini retries (but circuit breaker stops hammering when exhausted)
+# IMPORTANT: when quota is exhausted, retries are pointless
 GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
 GEMINI_RETRY_BASE_SLEEP = float(os.getenv("GEMINI_RETRY_BASE_SLEEP", "1.0"))
 
@@ -73,9 +79,6 @@ CB_BACKOFF_FACTOR = float(os.getenv("CB_BACKOFF_FACTOR", "2.0"))
 
 # Per-user cooldown
 USER_COOLDOWN_SECONDS = float(os.getenv("USER_COOLDOWN_SECONDS", "2.0"))
-
-# Workers AI image model
-CF_IMAGE_MODEL = os.getenv("CF_IMAGE_MODEL", "@cf/stabilityai/stable-diffusion-xl-base-1.0")
 
 # ------------------ SETUP ------------------
 http = requests.Session()
@@ -134,6 +137,14 @@ def _short(s: str, n: int = 350) -> str:
     return s[:n] + ("…" if len(s) > n else "")
 
 
+def _looks_like_jpeg(b: bytes) -> bool:
+    return len(b) >= 2 and b[0] == 0xFF and b[1] == 0xD8
+
+
+def _looks_like_png(b: bytes) -> bool:
+    return len(b) >= 8 and b[:8] == b"\x89PNG\r\n\x1a\n"
+
+
 # ------------------ DEDUPE ------------------
 def _mark_processed_once(mid: Optional[str]) -> bool:
     if not mid:
@@ -188,61 +199,80 @@ def send_mode_buttons(to: str):
     )
 
 
-# ------------------ CLOUDFLARE IMAGE GEN (binary OR JSON base64) ------------------
-def cf_generate_image(prompt: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+# ------------------ POLLINATIONS IMAGE GEN ------------------
+def pollinations_generate_image(
+    prompt: str,
+    model_name: str,
+    width: int,
+    height: int,
+    seed: Optional[int] = None,
+) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     """
     Returns (image_bytes, mime_type, error_text).
-    Supports two Cloudflare response formats:
-      1) Binary image with content-type image/*
-      2) JSON { result: { image: "<base64>" } } (often JPEG base64)
-    """
-    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
-        return None, None, "Cloudflare not configured (missing CF_ACCOUNT_ID/CF_API_TOKEN)."
 
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_IMAGE_MODEL}"
+    Uses Pollinations unified endpoint:
+      GET https://gen.pollinations.ai/image/{prompt}?key=...&model=...&width=...&height=...&seed=...
+    Typically returns binary image/*, but we also support JSON base64 (defensive).
+    """
+    if not POLLINATIONS_API_KEY:
+        return None, None, "Pollinations not configured (missing POLLINATIONS_API_KEY)."
+
+    safe_prompt = urllib.parse.quote(prompt, safe="")
+    url = f"https://gen.pollinations.ai/image/{safe_prompt}"
+
+    params = {
+        "key": POLLINATIONS_API_KEY,
+        "model": model_name,
+        "width": int(width),
+        "height": int(height),
+    }
+    if seed is not None:
+        params["seed"] = int(seed)
 
     try:
-        r = http.post(
-            url,
-            headers={"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"},
-            json={"prompt": prompt},
-            timeout=90,
-        )
+        r = http.get(url, params=params, timeout=120)
 
         if r.status_code < 200 or r.status_code >= 300:
-            log.error("cf_img_http_%s: %s", r.status_code, _short(r.text))
-            return None, None, f"Cloudflare AI error ({r.status_code}). {_short(r.text)}"
+            log.error("poll_img_http_%s: %s", r.status_code, _short(r.text))
+            return None, None, f"Pollinations error ({r.status_code}). {_short(r.text)}"
 
         ctype = (r.headers.get("content-type") or "").lower()
 
-        # 1) Binary image
+        # 1) binary image
         if "image/" in ctype:
             return r.content, ctype.split(";")[0], None
 
-        # 2) JSON base64 image
+        # 2) JSON base64 (defensive)
         if "application/json" in ctype:
             try:
                 data = r.json()
                 b64 = (data.get("result") or {}).get("image")
                 if isinstance(b64, str) and b64:
-                    # Workers AI tends to return JPEG base64 (your /9j/ prefix is JPEG)
-                    img_bytes = base64.b64decode(b64)
-                    return img_bytes, "image/jpeg", None
-                # Sometimes other keys appear; show a short diagnostic
-                return None, None, f"Cloudflare AI returned JSON but no result.image field. {_short(r.text)}"
+                    img = base64.b64decode(b64)
+                    # best-effort mime
+                    if _looks_like_png(img):
+                        return img, "image/png", None
+                    return img, "image/jpeg", None
+                return None, None, f"Pollinations returned JSON but no result.image. {_short(r.text)}"
             except Exception:
-                return None, None, f"Cloudflare AI returned JSON but could not parse it. {_short(r.text)}"
+                return None, None, f"Pollinations returned JSON but parse failed. {_short(r.text)}"
 
-        # Unexpected
-        log.error("cf_img_unexpected_ctype: %s body=%s", ctype, _short(r.text))
-        return None, None, f"Cloudflare AI returned unexpected content-type: {ctype}"
+        # Unknown: still try to interpret as image bytes
+        body = r.content
+        if _looks_like_png(body):
+            return body, "image/png", None
+        if _looks_like_jpeg(body):
+            return body, "image/jpeg", None
+
+        log.error("poll_img_unexpected_ctype: %s body=%s", ctype, _short(r.text))
+        return None, None, f"Pollinations returned unexpected content-type: {ctype}"
 
     except requests.exceptions.Timeout:
-        log.error("cf_img_timeout")
-        return None, None, "Cloudflare AI timed out."
+        log.error("poll_img_timeout")
+        return None, None, "Pollinations timed out."
     except Exception as e:
-        log.error("cf_img_failed: %s", type(e).__name__)
-        return None, None, "Cloudflare AI request failed."
+        log.error("poll_img_failed: %s", type(e).__name__)
+        return None, None, "Pollinations request failed."
 
 
 def wa_upload_media(image_bytes: bytes, mime_type: str = "image/jpeg") -> Tuple[Optional[str], Optional[str]]:
@@ -269,7 +299,13 @@ def wa_upload_media(image_bytes: bytes, mime_type: str = "image/jpeg") -> Tuple[
 
 
 def send_generated_image(to: str, prompt: str):
-    img_bytes, mime, err = cf_generate_image(prompt)
+    img_bytes, mime, err = pollinations_generate_image(
+        prompt=prompt,
+        model_name=POLLINATIONS_IMAGE_MODEL,
+        width=POLLINATIONS_WIDTH,
+        height=POLLINATIONS_HEIGHT,
+        seed=None,
+    )
     if err:
         send_text(to, err)
         return
@@ -421,6 +457,7 @@ def inbound():
                         continue
                     users.update_one({"_id": sender}, {"$set": {"last_user_at": now}}, upsert=True)
 
+                    # button reply
                     if msg.get("type") == "interactive":
                         try:
                             bid = msg["interactive"]["button_reply"]["id"]
@@ -438,6 +475,7 @@ def inbound():
                     if not txt:
                         continue
 
+                    # first message => show buttons once
                     if "mode" not in doc:
                         send_mode_buttons(sender)
                         continue
@@ -466,14 +504,17 @@ def inbound():
                         send_text(sender, "memory wiped from db")
                         continue
 
+                    # auto-detect image requests even in chat mode
                     if looks_like_image_request(txt):
                         send_generated_image(sender, txt)
                         continue
 
+                    # image mode
                     if doc.get("mode") == "img":
                         send_generated_image(sender, txt)
                         continue
 
+                    # chat mode
                     reply = get_chat_response(sender, txt)
                     send_text(sender, reply)
 
