@@ -3,11 +3,12 @@ import logging
 import time
 import base64
 import urllib.parse
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from dotenv import load_dotenv
 import google.generativeai as genai
 from pymongo import MongoClient, ASCENDING
@@ -48,34 +49,30 @@ MONGO_URI = os.getenv("MONGO_URI")
 
 # Pollinations
 POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY")
-
 POLLINATIONS_IMAGE_MODEL = os.getenv("POLLINATIONS_IMAGE_MODEL", "flux")
 POLLINATIONS_WIDTH = int(os.getenv("POLLINATIONS_WIDTH", "1024"))
 POLLINATIONS_HEIGHT = int(os.getenv("POLLINATIONS_HEIGHT", "1024"))
 
 POLLINATIONS_VIDEO_MODEL = os.getenv("POLLINATIONS_VIDEO_MODEL", "grok-video")
-POLLINATIONS_VIDEO_DURATION = int(os.getenv("POLLINATIONS_VIDEO_DURATION", "6"))  # 1-10 typical
-POLLINATIONS_VIDEO_ASPECT_RATIO = os.getenv("POLLINATIONS_VIDEO_ASPECT_RATIO", "16:9")  # "16:9" or "9:16"
+POLLINATIONS_VIDEO_DURATION = int(os.getenv("POLLINATIONS_VIDEO_DURATION", "6"))
+POLLINATIONS_VIDEO_ASPECT_RATIO = os.getenv("POLLINATIONS_VIDEO_ASPECT_RATIO", "16:9")
 POLLINATIONS_VIDEO_AUDIO = os.getenv("POLLINATIONS_VIDEO_AUDIO", "false").lower() in ("1", "true", "yes", "on")
+
+# Public URL for reference image proxy
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+REF_IMAGE_TTL_SECONDS = int(os.getenv("REF_IMAGE_TTL_SECONDS", "3600"))
+REF_DIR = os.getenv("REF_DIR", "/tmp/wa_ref_images")
 
 # dedupe
 DEDUP_TTL_HOURS = int(os.getenv("DEDUP_TTL_HOURS", "48"))
 
-# Gemini (bounded context)
+# Gemini
 CONTEXT_TURNS = int(os.getenv("CONTEXT_TURNS", "8"))
-
-# Gemini retries (circuit breaker handles ResourceExhausted)
 GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
 GEMINI_RETRY_BASE_SLEEP = float(os.getenv("GEMINI_RETRY_BASE_SLEEP", "1.0"))
 
-RATE_LIMIT_MESSAGE = os.getenv(
-    "RATE_LIMIT_MESSAGE",
-    "I’m rate-limited right now. Try again in {seconds}s.",
-)
-GENERIC_FAIL_MESSAGE = os.getenv(
-    "GEMINI_FAIL_MESSAGE",
-    "I’m having trouble right now. Try again in a moment.",
-)
+RATE_LIMIT_MESSAGE = os.getenv("RATE_LIMIT_MESSAGE", "I’m rate-limited right now. Try again in {seconds}s.")
+GENERIC_FAIL_MESSAGE = os.getenv("GEMINI_FAIL_MESSAGE", "I’m having trouble right now. Try again in a moment.")
 
 # Circuit breaker (global)
 CB_BASE_COOLDOWN = int(os.getenv("CB_BASE_COOLDOWN", "60"))
@@ -85,7 +82,12 @@ CB_BACKOFF_FACTOR = float(os.getenv("CB_BACKOFF_FACTOR", "2.0"))
 # Per-user cooldown
 USER_COOLDOWN_SECONDS = float(os.getenv("USER_COOLDOWN_SECONDS", "2.0"))
 
+# If True, image generation also uses last reference photo (image-to-image style)
+USE_REF_FOR_IMG = os.getenv("USE_REF_FOR_IMG", "false").lower() in ("1", "true", "yes", "on")
+
 # ------------------ SETUP ------------------
+os.makedirs(REF_DIR, exist_ok=True)
+
 http = requests.Session()
 
 genai.configure(api_key=GEMINI_API_KEY)
@@ -141,17 +143,34 @@ def _short(s: str, n: int = 350) -> str:
     return s[:n] + ("…" if len(s) > n else "")
 
 
-def _looks_like_jpeg(b: bytes) -> bool:
-    return len(b) >= 2 and b[0] == 0xFF and b[1] == 0xD8
-
-
-def _looks_like_png(b: bytes) -> bool:
-    return len(b) >= 8 and b[:8] == b"\x89PNG\r\n\x1a\n"
-
-
 def _looks_like_mp4(b: bytes) -> bool:
-    # MP4 often contains 'ftyp' at byte 4
     return len(b) >= 12 and b[4:8] == b"ftyp"
+
+
+def _guess_mime(b: bytes) -> str:
+    if len(b) >= 8 and b[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if len(b) >= 2 and b[0] == 0xFF and b[1] == 0xD8:
+        return "image/jpeg"
+    if _looks_like_mp4(b):
+        return "video/mp4"
+    return "application/octet-stream"
+
+
+def _cleanup_old_refs():
+    # best-effort cleanup
+    now = time.time()
+    try:
+        for fn in os.listdir(REF_DIR):
+            p = os.path.join(REF_DIR, fn)
+            try:
+                st = os.stat(p)
+                if now - st.st_mtime > REF_IMAGE_TTL_SECONDS:
+                    os.remove(p)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 # ------------------ DEDUPE ------------------
@@ -159,9 +178,7 @@ def _mark_processed_once(mid: Optional[str]) -> bool:
     if not mid:
         return True
     try:
-        processed.insert_one(
-            {"_id": mid, "expiresAt": datetime.now(timezone.utc) + timedelta(hours=DEDUP_TTL_HOURS)}
-        )
+        processed.insert_one({"_id": mid, "expiresAt": datetime.now(timezone.utc) + timedelta(hours=DEDUP_TTL_HOURS)})
         return True
     except DuplicateKeyError:
         return False
@@ -189,7 +206,6 @@ def send_text(to: str, body: str):
 
 
 def send_mode_buttons(to: str):
-    # 3 buttons: image / video / chat
     _wa_send(
         {
             "messaging_product": "whatsapp",
@@ -211,15 +227,12 @@ def send_mode_buttons(to: str):
 
 
 def wa_upload_media(media_bytes: bytes, filename: str, mime_type: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Upload media to WhatsApp to get a media_id.
-    """
     try:
         url = f"https://graph.facebook.com/v21.0/{PHONE_ID}/media"
         files = {"file": (filename, media_bytes, mime_type)}
         data = {"messaging_product": "whatsapp"}
 
-        r = http.post(url, headers={"Authorization": f"Bearer {WA_TOKEN}"}, files=files, data=data, timeout=60)
+        r = http.post(url, headers={"Authorization": f"Bearer {WA_TOKEN}"}, files=files, data=data, timeout=90)
 
         if r.status_code < 200 or r.status_code >= 300:
             log.error("wa_media_http_%s: %s", r.status_code, _short(r.text))
@@ -237,18 +250,93 @@ def wa_upload_media(media_bytes: bytes, filename: str, mime_type: str) -> Tuple[
 
 
 def send_image_by_media_id(to: str, media_id: str, caption: str = "Generated image"):
-    _wa_send(
-        {"messaging_product": "whatsapp", "to": to, "type": "image", "image": {"id": media_id, "caption": caption}}
-    )
+    _wa_send({"messaging_product": "whatsapp", "to": to, "type": "image", "image": {"id": media_id, "caption": caption}})
 
 
 def send_video_by_media_id(to: str, media_id: str, caption: str = "Generated video"):
-    _wa_send(
-        {"messaging_product": "whatsapp", "to": to, "type": "video", "video": {"id": media_id, "caption": caption}}
+    _wa_send({"messaging_product": "whatsapp", "to": to, "type": "video", "video": {"id": media_id, "caption": caption}})
+
+
+# ------------------ WHATSAPP MEDIA FETCH (for reference images) ------------------
+def wa_download_incoming_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+    """
+    1) GET /{media_id} -> {url, mime_type}
+    2) GET url with Authorization header -> bytes
+    """
+    try:
+        meta = http.get(
+            f"https://graph.facebook.com/v21.0/{media_id}",
+            headers={"Authorization": f"Bearer {WA_TOKEN}"},
+            timeout=20,
+        )
+        if meta.status_code < 200 or meta.status_code >= 300:
+            return None, None, f"WhatsApp media meta error ({meta.status_code}). {_short(meta.text)}"
+
+        j = meta.json() or {}
+        url = j.get("url")
+        mime = j.get("mime_type") or "application/octet-stream"
+        if not url:
+            return None, None, "WhatsApp media meta returned no url."
+
+        blob = http.get(url, headers={"Authorization": f"Bearer {WA_TOKEN}"}, timeout=60)
+        if blob.status_code < 200 or blob.status_code >= 300:
+            return None, None, f"WhatsApp media download error ({blob.status_code}). {_short(blob.text)}"
+
+        return blob.content, mime, None
+    except Exception as e:
+        return None, None, f"WhatsApp media download failed: {type(e).__name__}"
+
+
+def store_reference_image(uid: str, image_bytes: bytes) -> str:
+    """
+    Save to disk and store token in Mongo (tiny storage usage).
+    """
+    _cleanup_old_refs()
+    token = secrets.token_urlsafe(20)
+    path = os.path.join(REF_DIR, token)
+    with open(path, "wb") as f:
+        f.write(image_bytes)
+
+    users.update_one(
+        {"_id": uid},
+        {"$set": {"ref_token": token, "ref_set_at": time.time()}},
+        upsert=True,
     )
+    return token
 
 
-# ------------------ POLLINATIONS MEDIA GEN (image OR video) ------------------
+def get_reference_image_url(uid: str) -> Optional[str]:
+    if not PUBLIC_BASE_URL:
+        return None
+    doc = users.find_one({"_id": uid}, {"ref_token": 1, "ref_set_at": 1}) or {}
+    token = doc.get("ref_token")
+    ts = doc.get("ref_set_at")
+    if not token or not isinstance(token, str):
+        return None
+    if isinstance(ts, (int, float)) and (time.time() - ts) > REF_IMAGE_TTL_SECONDS:
+        return None
+    return f"{PUBLIC_BASE_URL}/ref/{token}"
+
+
+@app.route("/ref/<token>", methods=["GET"])
+def serve_ref(token: str):
+    """
+    Public endpoint for Pollinations to fetch the reference image.
+    """
+    _cleanup_old_refs()
+    path = os.path.join(REF_DIR, token)
+    if not os.path.isfile(path):
+        return "Not found", 404
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+        mime = _guess_mime(blob)
+        return Response(blob, status=200, mimetype=mime)
+    except Exception:
+        return "Error", 500
+
+
+# ------------------ POLLINATIONS MEDIA GEN ------------------
 def pollinations_generate_media(
     prompt: str,
     model_name: str,
@@ -259,16 +347,11 @@ def pollinations_generate_media(
     aspect_ratio: Optional[str] = None,
     audio: Optional[bool] = None,
     seed: Optional[int] = None,
+    image_url: Optional[str] = None,  # reference image URL
 ) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     """
-    Returns (bytes, mime_type, error_text).
-
-    Uses Pollinations unified endpoint:
-      GET https://gen.pollinations.ai/image/{prompt}?model=...&width=...&height=...&duration=...&aspectRatio=...&audio=...
-    Can return:
-      - image/jpeg or image/png
-      - video/mp4
-      - or application/json with base64 in result.image (sometimes)
+    GET https://gen.pollinations.ai/image/{prompt}?model=...&width=...&height=...&duration=...&aspectRatio=...&audio=...&image=...
+    Typically returns binary image/* or video/mp4. Some paths may return JSON with base64 in result.image.
     """
     if not POLLINATIONS_API_KEY:
         return None, None, "Pollinations not configured (missing POLLINATIONS_API_KEY)."
@@ -276,16 +359,10 @@ def pollinations_generate_media(
     safe_prompt = urllib.parse.quote(prompt, safe="")
     url = f"https://gen.pollinations.ai/image/{safe_prompt}"
 
-    params: Dict[str, Any] = {
-        "key": POLLINATIONS_API_KEY,
-        "model": model_name,
-        "width": int(width),
-        "height": int(height),
-    }
+    params: Dict[str, Any] = {"model": model_name, "width": int(width), "height": int(height), "key": POLLINATIONS_API_KEY}
     if seed is not None:
         params["seed"] = int(seed)
 
-    # video params
     if duration is not None:
         params["duration"] = int(duration)
     if aspect_ratio is not None:
@@ -293,72 +370,55 @@ def pollinations_generate_media(
     if audio is not None:
         params["audio"] = "true" if audio else "false"
 
+    if image_url:
+        params["image"] = image_url  # reference image
+
     headers = {"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}
 
     try:
-        r = http.get(url, params=params, headers=headers, timeout=180)
-
+        r = http.get(url, params=params, headers=headers, timeout=240)
         if r.status_code < 200 or r.status_code >= 300:
-            log.error("poll_media_http_%s: %s", r.status_code, _short(r.text))
             return None, None, f"Pollinations error ({r.status_code}). {_short(r.text)}"
 
         ctype = (r.headers.get("content-type") or "").lower()
 
-        # binary image/video
         if "image/" in ctype or "video/" in ctype:
             return r.content, ctype.split(";")[0], None
 
-        # JSON base64 (defensive)
         if "application/json" in ctype:
             try:
                 data = r.json()
                 b64 = (data.get("result") or {}).get("image")
                 if isinstance(b64, str) and b64:
                     blob = base64.b64decode(b64)
-                    # best-effort type sniff
-                    if _looks_like_mp4(blob):
-                        return blob, "video/mp4", None
-                    if _looks_like_png(blob):
-                        return blob, "image/png", None
-                    if _looks_like_jpeg(blob):
-                        return blob, "image/jpeg", None
-                    return blob, "application/octet-stream", None
-                return None, None, f"Pollinations returned JSON but no result.image field. {_short(r.text)}"
+                    return blob, _guess_mime(blob), None
+                return None, None, f"Pollinations returned JSON but no result.image. {_short(r.text)}"
             except Exception:
                 return None, None, f"Pollinations JSON parse failed. {_short(r.text)}"
 
-        # Unknown but maybe bytes are still media
         blob = r.content
-        if _looks_like_mp4(blob):
-            return blob, "video/mp4", None
-        if _looks_like_png(blob):
-            return blob, "image/png", None
-        if _looks_like_jpeg(blob):
-            return blob, "image/jpeg", None
-
-        log.error("poll_media_unexpected_ctype: %s body=%s", ctype, _short(r.text))
-        return None, None, f"Pollinations returned unexpected content-type: {ctype}"
+        return blob, _guess_mime(blob), None
 
     except requests.exceptions.Timeout:
-        log.error("poll_media_timeout")
         return None, None, "Pollinations timed out."
     except Exception as e:
-        log.error("poll_media_failed: %s", type(e).__name__)
-        return None, None, "Pollinations request failed."
+        return None, None, f"Pollinations request failed: {type(e).__name__}"
 
 
-def send_generated_image(to: str, prompt: str):
+def send_generated_image(to: str, prompt: str, *, ref_url: Optional[str] = None):
+    send_text(to, "Generating image…")
     blob, mime, err = pollinations_generate_media(
         prompt=prompt,
         model_name=POLLINATIONS_IMAGE_MODEL,
         width=POLLINATIONS_WIDTH,
         height=POLLINATIONS_HEIGHT,
+        image_url=ref_url if USE_REF_FOR_IMG else None,
     )
     if err:
         send_text(to, err)
         return
-    if not blob or not mime:
-        send_text(to, "Image generation failed.")
+    if not blob or not mime or not mime.startswith("image/"):
+        send_text(to, f"Image generation failed (got {mime or 'no mime'}).")
         return
 
     filename = "image.png" if mime == "image/png" else "image.jpg"
@@ -369,21 +429,22 @@ def send_generated_image(to: str, prompt: str):
     send_image_by_media_id(to, media_id)
 
 
-def send_generated_video(to: str, prompt: str):
+def send_generated_video(to: str, prompt: str, *, ref_url: Optional[str] = None):
+    send_text(to, "Generating video… (this can take a bit)")
     blob, mime, err = pollinations_generate_media(
         prompt=prompt,
-        model_name=POLLINATIONS_VIDEO_MODEL,  # grok-video by default
+        model_name=POLLINATIONS_VIDEO_MODEL,
         width=POLLINATIONS_WIDTH,
         height=POLLINATIONS_HEIGHT,
         duration=POLLINATIONS_VIDEO_DURATION,
         aspect_ratio=POLLINATIONS_VIDEO_ASPECT_RATIO,
         audio=POLLINATIONS_VIDEO_AUDIO,
+        image_url=ref_url,  # reference image
     )
     if err:
         send_text(to, err)
         return
     if not blob or not mime or mime != "video/mp4":
-        # If Pollinations returned something else, show the mime for debugging
         send_text(to, f"Video generation failed (got {mime or 'no mime'}).")
         return
 
@@ -397,13 +458,7 @@ def send_generated_video(to: str, prompt: str):
 # ------------------ GEMINI ------------------
 def _looks_rate_limited(exc: Exception) -> bool:
     msg = str(exc).lower()
-    return (
-        "resourceexhausted" in msg
-        or "resource_exhausted" in msg
-        or "quota" in msg
-        or "rate" in msg
-        or "429" in msg
-    )
+    return "resourceexhausted" in msg or "resource_exhausted" in msg or "quota" in msg or "rate" in msg or "429" in msg
 
 
 def _call_gemini(history: List[Dict[str, Any]], prompt: str) -> Tuple[Optional[str], Optional[str]]:
@@ -422,7 +477,6 @@ def _call_gemini(history: List[Dict[str, Any]], prompt: str) -> Tuple[Optional[s
                 log.warning("gemini_rate_limited: %s", type(e).__name__)
                 _cb_trip()
                 return None, "RATE_LIMIT"
-
             log.warning("gemini_attempt_%s_failed: %s", attempt, type(e).__name__)
             time.sleep(GEMINI_RETRY_BASE_SLEEP * (2 ** (attempt - 1)))
 
@@ -472,30 +526,12 @@ def get_chat_response(uid: str, prompt: str) -> str:
 # ------------------ INTENT DETECTION ------------------
 def looks_like_image_request(text: str) -> bool:
     t = text.lower()
-    triggers = [
-        "generate image",
-        "create image",
-        "make an image",
-        "generate a picture",
-        "create a picture",
-        "draw",
-        "make a picture",
-        "turn this into an image",
-    ]
-    return any(x in t for x in triggers)
+    return any(x in t for x in ["generate image", "create image", "make an image", "generate a picture", "create a picture", "draw"])
 
 
 def looks_like_video_request(text: str) -> bool:
     t = text.lower()
-    triggers = [
-        "generate video",
-        "create video",
-        "make a video",
-        "animate this",
-        "turn this into a video",
-        "video of",
-    ]
-    return any(x in t for x in triggers)
+    return any(x in t for x in ["generate video", "create video", "make a video", "animate this", "turn this into a video", "video of"])
 
 
 # ------------------ WEBHOOK ------------------
@@ -541,16 +577,31 @@ def inbound():
                     if msg.get("type") == "interactive":
                         try:
                             bid = msg["interactive"]["button_reply"]["id"]
-                            if bid == "IMG_MODE":
-                                mode = "img"
-                            elif bid == "VID_MODE":
-                                mode = "vid"
-                            else:
-                                mode = "chat"
+                            mode = "img" if bid == "IMG_MODE" else ("vid" if bid == "VID_MODE" else "chat")
                             users.update_one({"_id": sender}, {"$set": {"mode": mode}}, upsert=True)
                             send_text(sender, f"Mode set to {mode}.")
                         except Exception:
                             send_text(sender, "Could not read button reply.")
+                        continue
+
+                    # incoming image = set reference
+                    if msg.get("type") == "image":
+                        media_id = (msg.get("image") or {}).get("id")
+                        if not media_id:
+                            send_text(sender, "I couldn’t read that image.")
+                            continue
+                        img_bytes, img_mime, err = wa_download_incoming_media(media_id)
+                        if err or not img_bytes:
+                            send_text(sender, err or "Could not download the image.")
+                            continue
+                        token = store_reference_image(sender, img_bytes)
+                        if PUBLIC_BASE_URL:
+                            send_text(sender, "Reference photo saved ✅ Now send /vidgen <prompt> (or just type your prompt in Video mode).")
+                        else:
+                            send_text(
+                                sender,
+                                "Reference photo received ✅ BUT your server has no PUBLIC_BASE_URL set, so I can’t pass it to Pollinations. Set PUBLIC_BASE_URL first.",
+                            )
                         continue
 
                     if msg.get("type") != "text":
@@ -565,15 +616,16 @@ def inbound():
                         send_mode_buttons(sender)
                         continue
 
+                    ref_url = get_reference_image_url(sender)
+
                     low = txt.lower()
 
-                    # commands
                     if low.startswith("/imggen"):
                         prompt = txt[7:].strip()
                         if not prompt:
                             send_text(sender, "Usage: /imggen your prompt here")
                         else:
-                            send_generated_image(sender, prompt)
+                            send_generated_image(sender, prompt, ref_url=ref_url)
                         continue
 
                     if low.startswith("/vidgen"):
@@ -581,7 +633,7 @@ def inbound():
                         if not prompt:
                             send_text(sender, "Usage: /vidgen your prompt here")
                         else:
-                            send_generated_video(sender, prompt)
+                            send_generated_video(sender, prompt, ref_url=ref_url)
                         continue
 
                     if low.startswith("/mode"):
@@ -598,25 +650,26 @@ def inbound():
                         send_text(sender, "memory wiped from db")
                         continue
 
-                    # auto intent detection (works even in chat mode)
+                    # auto detection
                     if looks_like_video_request(txt):
-                        send_generated_video(sender, txt)
+                        send_generated_video(sender, txt, ref_url=ref_url)
                         continue
 
                     if looks_like_image_request(txt):
-                        send_generated_image(sender, txt)
+                        send_generated_image(sender, txt, ref_url=ref_url)
                         continue
 
                     # mode behavior
-                    if doc.get("mode") == "vid":
-                        send_generated_video(sender, txt)
+                    mode = doc.get("mode")
+                    if mode == "vid":
+                        send_generated_video(sender, txt, ref_url=ref_url)
                         continue
 
-                    if doc.get("mode") == "img":
-                        send_generated_image(sender, txt)
+                    if mode == "img":
+                        send_generated_image(sender, txt, ref_url=ref_url)
                         continue
 
-                    # chat mode
+                    # chat
                     reply = get_chat_response(sender, txt)
                     send_text(sender, reply)
 
