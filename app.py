@@ -200,20 +200,14 @@ def send_mode_buttons(to: str):
 
 
 # ------------------ POLLINATIONS IMAGE GEN ------------------
-def pollinations_generate_image(
+ddef pollinations_generate_image(
     prompt: str,
     model_name: str,
     width: int,
     height: int,
     seed: Optional[int] = None,
 ) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
-    """
-    Returns (image_bytes, mime_type, error_text).
 
-    Uses Pollinations unified endpoint:
-      GET https://gen.pollinations.ai/image/{prompt}?key=...&model=...&width=...&height=...&seed=...
-    Typically returns binary image/*, but we also support JSON base64 (defensive).
-    """
     if not POLLINATIONS_API_KEY:
         return None, None, "Pollinations not configured (missing POLLINATIONS_API_KEY)."
 
@@ -221,7 +215,7 @@ def pollinations_generate_image(
     url = f"https://gen.pollinations.ai/image/{safe_prompt}"
 
     params = {
-        "key": POLLINATIONS_API_KEY,
+        "key": POLLINATIONS_API_KEY,   # query param
         "model": model_name,
         "width": int(width),
         "height": int(height),
@@ -229,50 +223,41 @@ def pollinations_generate_image(
     if seed is not None:
         params["seed"] = int(seed)
 
+    headers = {
+        "Authorization": f"Bearer {POLLINATIONS_API_KEY}",  # header auth
+    }
+
     try:
-        r = http.get(url, params=params, timeout=120)
+        r = http.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=120
+        )
 
         if r.status_code < 200 or r.status_code >= 300:
-            log.error("poll_img_http_%s: %s", r.status_code, _short(r.text))
-            return None, None, f"Pollinations error ({r.status_code}). {_short(r.text)}"
+            return None, None, f"Pollinations error ({r.status_code}). {r.text}"
 
         ctype = (r.headers.get("content-type") or "").lower()
 
-        # 1) binary image
         if "image/" in ctype:
             return r.content, ctype.split(";")[0], None
 
-        # 2) JSON base64 (defensive)
         if "application/json" in ctype:
             try:
                 data = r.json()
                 b64 = (data.get("result") or {}).get("image")
                 if isinstance(b64, str) and b64:
                     img = base64.b64decode(b64)
-                    # best-effort mime
-                    if _looks_like_png(img):
-                        return img, "image/png", None
                     return img, "image/jpeg", None
-                return None, None, f"Pollinations returned JSON but no result.image. {_short(r.text)}"
+                return None, None, f"Pollinations returned JSON but no image. {r.text}"
             except Exception:
-                return None, None, f"Pollinations returned JSON but parse failed. {_short(r.text)}"
+                return None, None, f"Pollinations JSON parse failed. {r.text}"
 
-        # Unknown: still try to interpret as image bytes
-        body = r.content
-        if _looks_like_png(body):
-            return body, "image/png", None
-        if _looks_like_jpeg(body):
-            return body, "image/jpeg", None
+        return None, None, f"Unexpected content-type: {ctype}"
 
-        log.error("poll_img_unexpected_ctype: %s body=%s", ctype, _short(r.text))
-        return None, None, f"Pollinations returned unexpected content-type: {ctype}"
-
-    except requests.exceptions.Timeout:
-        log.error("poll_img_timeout")
-        return None, None, "Pollinations timed out."
     except Exception as e:
-        log.error("poll_img_failed: %s", type(e).__name__)
-        return None, None, "Pollinations request failed."
+        return None, None, f"Pollinations request failed: {type(e).__name__}"
 
 
 def wa_upload_media(image_bytes: bytes, mime_type: str = "image/jpeg") -> Tuple[Optional[str], Optional[str]]:
