@@ -44,22 +44,27 @@ PHONE_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY = os.getenv("VERIFY_TOKEN")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
 MONGO_URI = os.getenv("MONGO_URI")
 
 # Pollinations
 POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY")
+
 POLLINATIONS_IMAGE_MODEL = os.getenv("POLLINATIONS_IMAGE_MODEL", "flux")
 POLLINATIONS_WIDTH = int(os.getenv("POLLINATIONS_WIDTH", "1024"))
 POLLINATIONS_HEIGHT = int(os.getenv("POLLINATIONS_HEIGHT", "1024"))
 
+POLLINATIONS_VIDEO_MODEL = os.getenv("POLLINATIONS_VIDEO_MODEL", "grok-video")
+POLLINATIONS_VIDEO_DURATION = int(os.getenv("POLLINATIONS_VIDEO_DURATION", "6"))  # 1-10 typical
+POLLINATIONS_VIDEO_ASPECT_RATIO = os.getenv("POLLINATIONS_VIDEO_ASPECT_RATIO", "16:9")  # "16:9" or "9:16"
+POLLINATIONS_VIDEO_AUDIO = os.getenv("POLLINATIONS_VIDEO_AUDIO", "false").lower() in ("1", "true", "yes", "on")
+
 # dedupe
 DEDUP_TTL_HOURS = int(os.getenv("DEDUP_TTL_HOURS", "48"))
 
-# Gemini
+# Gemini (bounded context)
 CONTEXT_TURNS = int(os.getenv("CONTEXT_TURNS", "8"))
 
-# IMPORTANT: when quota is exhausted, retries are pointless
+# Gemini retries (circuit breaker handles ResourceExhausted)
 GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
 GEMINI_RETRY_BASE_SLEEP = float(os.getenv("GEMINI_RETRY_BASE_SLEEP", "1.0"))
 
@@ -103,7 +108,6 @@ def _safe_indexes():
 
 _safe_indexes()
 
-
 # ------------------ CIRCUIT BREAKER STATE ------------------
 _cb_until = 0.0
 _cb_cooldown = float(CB_BASE_COOLDOWN)
@@ -145,6 +149,11 @@ def _looks_like_png(b: bytes) -> bool:
     return len(b) >= 8 and b[:8] == b"\x89PNG\r\n\x1a\n"
 
 
+def _looks_like_mp4(b: bytes) -> bool:
+    # MP4 often contains 'ftyp' at byte 4
+    return len(b) >= 12 and b[4:8] == b"ftyp"
+
+
 # ------------------ DEDUPE ------------------
 def _mark_processed_once(mid: Optional[str]) -> bool:
     if not mid:
@@ -180,6 +189,7 @@ def send_text(to: str, body: str):
 
 
 def send_mode_buttons(to: str):
+    # 3 buttons: image / video / chat
     _wa_send(
         {
             "messaging_product": "whatsapp",
@@ -190,8 +200,9 @@ def send_mode_buttons(to: str):
                 "body": {"text": "What do you want to do?"},
                 "action": {
                     "buttons": [
-                        {"type": "reply", "reply": {"id": "IMG_MODE", "title": "🖼️ Generate image"}},
-                        {"type": "reply", "reply": {"id": "CHAT_MODE", "title": "💬 Chat with AI"}},
+                        {"type": "reply", "reply": {"id": "IMG_MODE", "title": "🖼️ Image"}},
+                        {"type": "reply", "reply": {"id": "VID_MODE", "title": "🎬 Video"}},
+                        {"type": "reply", "reply": {"id": "CHAT_MODE", "title": "💬 Chat"}},
                     ]
                 },
             },
@@ -199,74 +210,16 @@ def send_mode_buttons(to: str):
     )
 
 
-# ------------------ POLLINATIONS IMAGE GEN ------------------
-def pollinations_generate_image(
-    prompt: str,
-    model_name: str,
-    width: int,
-    height: int,
-    seed: Optional[int] = None,
-) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
-
-    if not POLLINATIONS_API_KEY:
-        return None, None, "Pollinations not configured (missing POLLINATIONS_API_KEY)."
-
-    safe_prompt = urllib.parse.quote(prompt, safe="")
-    url = f"https://gen.pollinations.ai/image/{safe_prompt}"
-
-    params = {
-        "key": POLLINATIONS_API_KEY,   # query param
-        "model": model_name,
-        "width": int(width),
-        "height": int(height),
-    }
-    if seed is not None:
-        params["seed"] = int(seed)
-
-    headers = {
-        "Authorization": f"Bearer {POLLINATIONS_API_KEY}",  # header auth
-    }
-
-    try:
-        r = http.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=120
-        )
-
-        if r.status_code < 200 or r.status_code >= 300:
-            return None, None, f"Pollinations error ({r.status_code}). {r.text}"
-
-        ctype = (r.headers.get("content-type") or "").lower()
-
-        if "image/" in ctype:
-            return r.content, ctype.split(";")[0], None
-
-        if "application/json" in ctype:
-            try:
-                data = r.json()
-                b64 = (data.get("result") or {}).get("image")
-                if isinstance(b64, str) and b64:
-                    img = base64.b64decode(b64)
-                    return img, "image/jpeg", None
-                return None, None, f"Pollinations returned JSON but no image. {r.text}"
-            except Exception:
-                return None, None, f"Pollinations JSON parse failed. {r.text}"
-
-        return None, None, f"Unexpected content-type: {ctype}"
-
-    except Exception as e:
-        return None, None, f"Pollinations request failed: {type(e).__name__}"
-
-
-def wa_upload_media(image_bytes: bytes, mime_type: str = "image/jpeg") -> Tuple[Optional[str], Optional[str]]:
+def wa_upload_media(media_bytes: bytes, filename: str, mime_type: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Upload media to WhatsApp to get a media_id.
+    """
     try:
         url = f"https://graph.facebook.com/v21.0/{PHONE_ID}/media"
-        files = {"file": ("image.jpg", image_bytes, mime_type)}
+        files = {"file": (filename, media_bytes, mime_type)}
         data = {"messaging_product": "whatsapp"}
 
-        r = http.post(url, headers={"Authorization": f"Bearer {WA_TOKEN}"}, files=files, data=data, timeout=30)
+        r = http.post(url, headers={"Authorization": f"Bearer {WA_TOKEN}"}, files=files, data=data, timeout=60)
 
         if r.status_code < 200 or r.status_code >= 300:
             log.error("wa_media_http_%s: %s", r.status_code, _short(r.text))
@@ -283,34 +236,162 @@ def wa_upload_media(image_bytes: bytes, mime_type: str = "image/jpeg") -> Tuple[
         return None, "WhatsApp media upload failed."
 
 
+def send_image_by_media_id(to: str, media_id: str, caption: str = "Generated image"):
+    _wa_send(
+        {"messaging_product": "whatsapp", "to": to, "type": "image", "image": {"id": media_id, "caption": caption}}
+    )
+
+
+def send_video_by_media_id(to: str, media_id: str, caption: str = "Generated video"):
+    _wa_send(
+        {"messaging_product": "whatsapp", "to": to, "type": "video", "video": {"id": media_id, "caption": caption}}
+    )
+
+
+# ------------------ POLLINATIONS MEDIA GEN (image OR video) ------------------
+def pollinations_generate_media(
+    prompt: str,
+    model_name: str,
+    width: int,
+    height: int,
+    *,
+    duration: Optional[int] = None,
+    aspect_ratio: Optional[str] = None,
+    audio: Optional[bool] = None,
+    seed: Optional[int] = None,
+) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+    """
+    Returns (bytes, mime_type, error_text).
+
+    Uses Pollinations unified endpoint:
+      GET https://gen.pollinations.ai/image/{prompt}?model=...&width=...&height=...&duration=...&aspectRatio=...&audio=...
+    Can return:
+      - image/jpeg or image/png
+      - video/mp4
+      - or application/json with base64 in result.image (sometimes)
+    """
+    if not POLLINATIONS_API_KEY:
+        return None, None, "Pollinations not configured (missing POLLINATIONS_API_KEY)."
+
+    safe_prompt = urllib.parse.quote(prompt, safe="")
+    url = f"https://gen.pollinations.ai/image/{safe_prompt}"
+
+    params: Dict[str, Any] = {
+        "key": POLLINATIONS_API_KEY,
+        "model": model_name,
+        "width": int(width),
+        "height": int(height),
+    }
+    if seed is not None:
+        params["seed"] = int(seed)
+
+    # video params
+    if duration is not None:
+        params["duration"] = int(duration)
+    if aspect_ratio is not None:
+        params["aspectRatio"] = aspect_ratio
+    if audio is not None:
+        params["audio"] = "true" if audio else "false"
+
+    headers = {"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}
+
+    try:
+        r = http.get(url, params=params, headers=headers, timeout=180)
+
+        if r.status_code < 200 or r.status_code >= 300:
+            log.error("poll_media_http_%s: %s", r.status_code, _short(r.text))
+            return None, None, f"Pollinations error ({r.status_code}). {_short(r.text)}"
+
+        ctype = (r.headers.get("content-type") or "").lower()
+
+        # binary image/video
+        if "image/" in ctype or "video/" in ctype:
+            return r.content, ctype.split(";")[0], None
+
+        # JSON base64 (defensive)
+        if "application/json" in ctype:
+            try:
+                data = r.json()
+                b64 = (data.get("result") or {}).get("image")
+                if isinstance(b64, str) and b64:
+                    blob = base64.b64decode(b64)
+                    # best-effort type sniff
+                    if _looks_like_mp4(blob):
+                        return blob, "video/mp4", None
+                    if _looks_like_png(blob):
+                        return blob, "image/png", None
+                    if _looks_like_jpeg(blob):
+                        return blob, "image/jpeg", None
+                    return blob, "application/octet-stream", None
+                return None, None, f"Pollinations returned JSON but no result.image field. {_short(r.text)}"
+            except Exception:
+                return None, None, f"Pollinations JSON parse failed. {_short(r.text)}"
+
+        # Unknown but maybe bytes are still media
+        blob = r.content
+        if _looks_like_mp4(blob):
+            return blob, "video/mp4", None
+        if _looks_like_png(blob):
+            return blob, "image/png", None
+        if _looks_like_jpeg(blob):
+            return blob, "image/jpeg", None
+
+        log.error("poll_media_unexpected_ctype: %s body=%s", ctype, _short(r.text))
+        return None, None, f"Pollinations returned unexpected content-type: {ctype}"
+
+    except requests.exceptions.Timeout:
+        log.error("poll_media_timeout")
+        return None, None, "Pollinations timed out."
+    except Exception as e:
+        log.error("poll_media_failed: %s", type(e).__name__)
+        return None, None, "Pollinations request failed."
+
+
 def send_generated_image(to: str, prompt: str):
-    img_bytes, mime, err = pollinations_generate_image(
+    blob, mime, err = pollinations_generate_media(
         prompt=prompt,
         model_name=POLLINATIONS_IMAGE_MODEL,
         width=POLLINATIONS_WIDTH,
         height=POLLINATIONS_HEIGHT,
-        seed=None,
     )
     if err:
         send_text(to, err)
         return
-    if not img_bytes:
+    if not blob or not mime:
         send_text(to, "Image generation failed.")
         return
 
-    media_id, up_err = wa_upload_media(img_bytes, mime_type=mime or "image/jpeg")
+    filename = "image.png" if mime == "image/png" else "image.jpg"
+    media_id, up_err = wa_upload_media(blob, filename=filename, mime_type=mime)
     if up_err:
         send_text(to, up_err)
         return
+    send_image_by_media_id(to, media_id)
 
-    _wa_send(
-        {
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "image",
-            "image": {"id": media_id, "caption": "Generated image"},
-        }
+
+def send_generated_video(to: str, prompt: str):
+    blob, mime, err = pollinations_generate_media(
+        prompt=prompt,
+        model_name=POLLINATIONS_VIDEO_MODEL,  # grok-video by default
+        width=POLLINATIONS_WIDTH,
+        height=POLLINATIONS_HEIGHT,
+        duration=POLLINATIONS_VIDEO_DURATION,
+        aspect_ratio=POLLINATIONS_VIDEO_ASPECT_RATIO,
+        audio=POLLINATIONS_VIDEO_AUDIO,
     )
+    if err:
+        send_text(to, err)
+        return
+    if not blob or not mime or mime != "video/mp4":
+        # If Pollinations returned something else, show the mime for debugging
+        send_text(to, f"Video generation failed (got {mime or 'no mime'}).")
+        return
+
+    media_id, up_err = wa_upload_media(blob, filename="video.mp4", mime_type="video/mp4")
+    if up_err:
+        send_text(to, up_err)
+        return
+    send_video_by_media_id(to, media_id)
 
 
 # ------------------ GEMINI ------------------
@@ -388,7 +469,7 @@ def get_chat_response(uid: str, prompt: str) -> str:
         return GENERIC_FAIL_MESSAGE
 
 
-# ------------------ IMAGE INTENT DETECTION ------------------
+# ------------------ INTENT DETECTION ------------------
 def looks_like_image_request(text: str) -> bool:
     t = text.lower()
     triggers = [
@@ -400,6 +481,19 @@ def looks_like_image_request(text: str) -> bool:
         "draw",
         "make a picture",
         "turn this into an image",
+    ]
+    return any(x in t for x in triggers)
+
+
+def looks_like_video_request(text: str) -> bool:
+    t = text.lower()
+    triggers = [
+        "generate video",
+        "create video",
+        "make a video",
+        "animate this",
+        "turn this into a video",
+        "video of",
     ]
     return any(x in t for x in triggers)
 
@@ -434,6 +528,7 @@ def inbound():
                     if not sender:
                         continue
 
+                    # per-user cooldown
                     now = time.time()
                     doc = users.find_one({"_id": sender}, {"mode": 1, "last_user_at": 1}) or {}
                     last_user_at = doc.get("last_user_at", 0)
@@ -446,7 +541,12 @@ def inbound():
                     if msg.get("type") == "interactive":
                         try:
                             bid = msg["interactive"]["button_reply"]["id"]
-                            mode = "img" if bid == "IMG_MODE" else "chat"
+                            if bid == "IMG_MODE":
+                                mode = "img"
+                            elif bid == "VID_MODE":
+                                mode = "vid"
+                            else:
+                                mode = "chat"
                             users.update_one({"_id": sender}, {"$set": {"mode": mode}}, upsert=True)
                             send_text(sender, f"Mode set to {mode}.")
                         except Exception:
@@ -467,6 +567,7 @@ def inbound():
 
                     low = txt.lower()
 
+                    # commands
                     if low.startswith("/imggen"):
                         prompt = txt[7:].strip()
                         if not prompt:
@@ -475,13 +576,21 @@ def inbound():
                             send_generated_image(sender, prompt)
                         continue
 
+                    if low.startswith("/vidgen"):
+                        prompt = txt[7:].strip()
+                        if not prompt:
+                            send_text(sender, "Usage: /vidgen your prompt here")
+                        else:
+                            send_generated_video(sender, prompt)
+                        continue
+
                     if low.startswith("/mode"):
                         arg = low[5:].strip()
-                        if arg in ("chat", "img"):
+                        if arg in ("chat", "img", "vid"):
                             users.update_one({"_id": sender}, {"$set": {"mode": arg}}, upsert=True)
                             send_text(sender, f"Mode set to {arg}.")
                         else:
-                            send_text(sender, "Usage: /mode chat  OR  /mode img")
+                            send_text(sender, "Usage: /mode chat  OR  /mode img  OR  /mode vid")
                         continue
 
                     if low == "/reset":
@@ -489,12 +598,20 @@ def inbound():
                         send_text(sender, "memory wiped from db")
                         continue
 
-                    # auto-detect image requests even in chat mode
+                    # auto intent detection (works even in chat mode)
+                    if looks_like_video_request(txt):
+                        send_generated_video(sender, txt)
+                        continue
+
                     if looks_like_image_request(txt):
                         send_generated_image(sender, txt)
                         continue
 
-                    # image mode
+                    # mode behavior
+                    if doc.get("mode") == "vid":
+                        send_generated_video(sender, txt)
+                        continue
+
                     if doc.get("mode") == "img":
                         send_generated_image(sender, txt)
                         continue
