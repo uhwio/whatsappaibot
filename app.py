@@ -4,6 +4,7 @@ import base64
 import secrets
 import urllib.parse
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -59,9 +60,9 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash")
 POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY")
 POLLINATIONS_IMAGE_MODEL = os.getenv("POLLINATIONS_IMAGE_MODEL", "flux")
 POLLINATIONS_VIDEO_MODEL = os.getenv("POLLINATIONS_VIDEO_MODEL", "grok-video")
-POLLINATIONS_WIDTH = int(os.getenv("POLLINATIONS_WIDTH", "768"))
-POLLINATIONS_HEIGHT = int(os.getenv("POLLINATIONS_HEIGHT", "768"))
-POLLINATIONS_VIDEO_DURATION = int(os.getenv("POLLINATIONS_VIDEO_DURATION", "5"))
+POLLINATIONS_WIDTH = int(os.getenv("POLLINATIONS_WIDTH", "512"))
+POLLINATIONS_HEIGHT = int(os.getenv("POLLINATIONS_HEIGHT", "512"))
+POLLINATIONS_VIDEO_DURATION = int(os.getenv("POLLINATIONS_VIDEO_DURATION", "3"))
 POLLINATIONS_VIDEO_ASPECT_RATIO = os.getenv("POLLINATIONS_VIDEO_ASPECT_RATIO", "16:9")
 POLLINATIONS_VIDEO_AUDIO = os.getenv("POLLINATIONS_VIDEO_AUDIO", "false").lower() in ("1", "true", "yes", "on")
 
@@ -94,7 +95,6 @@ ANIME_VIDEO_PROMPT = os.getenv(
     "soft shadows, high fidelity, anime movie look"
 )
 
-# Onboarding/help text
 WELCOME_TEXT = (
     "Olá! 👋\n\n"
     "Eu posso:\n"
@@ -262,7 +262,6 @@ def store_reference_image(uid: str, image_bytes: bytes) -> str:
     with open(path, "wb") as f:
         f.write(image_bytes)
 
-    # minimal DB usage: just token + timestamp
     users.update_one(
         {"_id": uid},
         {"$set": {"ref_token": token, "ref_set_at": time.time()}},
@@ -296,7 +295,7 @@ def serve_ref(token: str):
         return "Erro", 500
 
 # =========================
-# Pollinations (image/video)
+# Pollinations (image/video) with retry + configurable timeouts
 # =========================
 def pollinations_generate_media(
     prompt: str,
@@ -309,6 +308,8 @@ def pollinations_generate_media(
     audio: Optional[bool] = None,
     seed: Optional[int] = None,
     image_url: Optional[str] = None,
+    timeout_seconds: int = 240,
+    retries: int = 1,
 ) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     if not POLLINATIONS_API_KEY:
         return None, None, "Pollinations não configurado (faltando POLLINATIONS_API_KEY)."
@@ -335,34 +336,42 @@ def pollinations_generate_media(
 
     headers = {"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}
 
-    try:
-        r = http.get(url, params=params, headers=headers, timeout=240)
-        if r.status_code < 200 or r.status_code >= 300:
-            return None, None, f"Erro Pollinations ({r.status_code}). {_short(r.text)}"
+    for attempt in range(retries + 1):
+        try:
+            r = http.get(url, params=params, headers=headers, timeout=timeout_seconds)
 
-        ctype = (r.headers.get("content-type") or "").lower()
+            if r.status_code < 200 or r.status_code >= 300:
+                return None, None, f"Erro Pollinations ({r.status_code}). {_short(r.text)}"
 
-        if "image/" in ctype or "video/" in ctype:
-            return r.content, ctype.split(";")[0], None
+            ctype = (r.headers.get("content-type") or "").lower()
 
-        if "application/json" in ctype:
-            try:
-                data = r.json()
-                b64 = (data.get("result") or {}).get("image")
-                if isinstance(b64, str) and b64:
-                    blob = base64.b64decode(b64)
-                    return blob, _guess_mime(blob), None
-                return None, None, f"Pollinations retornou JSON sem imagem. {_short(r.text)}"
-            except Exception:
-                return None, None, f"Pollinations retornou JSON mas falhou ao ler. {_short(r.text)}"
+            if "image/" in ctype or "video/" in ctype:
+                return r.content, ctype.split(";")[0], None
 
-        blob = r.content
-        return blob, _guess_mime(blob), None
+            if "application/json" in ctype:
+                try:
+                    data = r.json()
+                    b64 = (data.get("result") or {}).get("image")
+                    if isinstance(b64, str) and b64:
+                        blob = base64.b64decode(b64)
+                        return blob, _guess_mime(blob), None
+                    return None, None, f"Pollinations retornou JSON sem imagem. {_short(r.text)}"
+                except Exception:
+                    return None, None, f"Pollinations retornou JSON mas falhou ao ler. {_short(r.text)}"
 
-    except requests.exceptions.Timeout:
-        return None, None, "Pollinations demorou demais e expirou (timeout)."
-    except Exception as e:
-        return None, None, f"Falha na requisição Pollinations: {type(e).__name__}"
+            blob = r.content
+            return blob, _guess_mime(blob), None
+
+        except requests.exceptions.Timeout:
+            if attempt < retries:
+                time.sleep(2.0 * (attempt + 1))
+                continue
+            return None, None, "Pollinations demorou demais e expirou (timeout)."
+
+        except Exception as e:
+            return None, None, f"Falha na requisição Pollinations: {type(e).__name__}"
+
+    return None, None, "Falha desconhecida."
 
 def generate_and_send_image(to: str, prompt: str):
     send_text(to, "Criando sua imagem... 🖼\nIsso pode levar alguns segundos.")
@@ -371,6 +380,8 @@ def generate_and_send_image(to: str, prompt: str):
         model_name=POLLINATIONS_IMAGE_MODEL,
         width=POLLINATIONS_WIDTH,
         height=POLLINATIONS_HEIGHT,
+        timeout_seconds=180,
+        retries=0,
     )
     if err:
         send_text(to, err)
@@ -387,7 +398,6 @@ def generate_and_send_image(to: str, prompt: str):
     send_image_by_id(to, media_id)
 
 def generate_and_send_video_from_photo(to: str, ref_url: Optional[str]):
-    send_text(to, "Criando seu vídeo... 🎬\nIsso pode levar cerca de 1 minuto.")
     blob, mime, err = pollinations_generate_media(
         prompt=ANIME_VIDEO_PROMPT,
         model_name=POLLINATIONS_VIDEO_MODEL,
@@ -397,10 +407,19 @@ def generate_and_send_video_from_photo(to: str, ref_url: Optional[str]):
         aspect_ratio=POLLINATIONS_VIDEO_ASPECT_RATIO,
         audio=POLLINATIONS_VIDEO_AUDIO,
         image_url=ref_url,
+        timeout_seconds=600,  # video can take longer
+        retries=1,            # retry once
     )
+
     if err:
-        send_text(to, err)
+        send_text(
+            to,
+            "Não consegui criar o vídeo agora 😕\n\n"
+            f"Motivo: {err}\n\n"
+            "Tente enviar a foto novamente em 1–2 minutos."
+        )
         return
+
     if not blob or mime != "video/mp4":
         send_text(to, f"Não consegui criar o vídeo (recebi {mime or 'sem tipo'}).")
         return
@@ -489,7 +508,7 @@ def chat_reply(uid: str, prompt: str) -> str:
         return GENERIC_FAIL_MESSAGE
 
 # =========================
-# Intent detection (simple & friendly)
+# Intent detection
 # =========================
 def parece_pedido_de_imagem(texto: str) -> bool:
     t = texto.lower().strip()
@@ -542,7 +561,7 @@ def inbound():
 
                     mtype = msg.get("type")
 
-                    # ---------- FOTO = VÍDEO AUTOMÁTICO
+                    # ---------- FOTO = VÍDEO AUTOMÁTICO (RUNS IN BACKGROUND)
                     if mtype == "image":
                         media_id = (msg.get("image") or {}).get("id")
                         if not media_id:
@@ -557,15 +576,15 @@ def inbound():
                         store_reference_image(sender, img_bytes)
                         ref_url = get_reference_url(sender)
 
-                        if not ref_url:
-                            send_text(
-                                sender,
-                                "Foto recebida ✅\n\n"
-                                "Obs: seu servidor não tem PUBLIC_BASE_URL configurado, então não consigo anexar a foto como referência.\n"
-                                "Mesmo assim, vou tentar criar um vídeo estilo anime."
-                            )
+                        send_text(sender, "Criando seu vídeo... 🎬\nIsso pode levar cerca de 1 minuto.")
 
-                        generate_and_send_video_from_photo(sender, ref_url)
+                        # IMPORTANT: do not block webhook thread
+                        threading.Thread(
+                            target=generate_and_send_video_from_photo,
+                            args=(sender, ref_url),
+                            daemon=True
+                        ).start()
+
                         continue
 
                     # ---------- TEXTO
@@ -578,7 +597,7 @@ def inbound():
 
                     low = txt.lower().strip()
 
-                    # comandos simples
+                    # comandos
                     if low in ("/menu", "menu", "/start", "start", "/help", "help"):
                         send_text(sender, WELCOME_TEXT)
                         continue
@@ -588,26 +607,23 @@ def inbound():
                         send_text(sender, "Memória apagada 🧹\nPodemos começar do zero.")
                         continue
 
-                    # onboarding: se usuário nunca falou, manda ajuda
-                    # (sem gastar muito no Mongo: só cria doc vazio se não existir)
+                    # onboarding (send help once if new)
                     if users.count_documents({"_id": sender}, limit=1) == 0:
                         send_text(sender, WELCOME_TEXT)
 
-                    # Se parecer pedido de imagem, gera imagem.
+                    # imagem
                     if parece_pedido_de_imagem(txt):
-                        # remove frases tipo "gera uma imagem de"
                         prompt = txt
                         for g in [
                             "gera uma imagem de", "gerar uma imagem de", "crie uma imagem de", "criar uma imagem de",
-                            "faz uma imagem de", "fazer uma imagem de", "desenha", "desenhe", "desenhar",
-                            "uma imagem de", "imagem de"
+                            "faz uma imagem de", "fazer uma imagem de", "uma imagem de", "imagem de"
                         ]:
                             prompt = prompt.lower().replace(g, "").strip()
                         prompt = prompt.strip() or txt
                         generate_and_send_image(sender, prompt)
                         continue
 
-                    # Caso contrário: conversa normal
+                    # conversa
                     reply = chat_reply(sender, txt)
                     send_text(sender, reply)
 
