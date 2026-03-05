@@ -398,36 +398,47 @@ def generate_and_send_image(to: str, prompt: str):
     send_image_by_id(to, media_id)
 
 def generate_and_send_video_from_photo(to: str, ref_url: Optional[str]):
-    blob, mime, err = pollinations_generate_media(
-        prompt=ANIME_VIDEO_PROMPT,
-        model_name=POLLINATIONS_VIDEO_MODEL,
-        width=POLLINATIONS_WIDTH,
-        height=POLLINATIONS_HEIGHT,
-        duration=POLLINATIONS_VIDEO_DURATION,
-        aspect_ratio=POLLINATIONS_VIDEO_ASPECT_RATIO,
-        audio=POLLINATIONS_VIDEO_AUDIO,
-        image_url=ref_url,
-        timeout_seconds=600,  # video can take longer
-        retries=1,            # retry once
-    )
 
-    if err:
+    for attempt in range(3):
+
+        blob, mime, err = pollinations_generate_media(
+            prompt=ANIME_VIDEO_PROMPT,
+            model_name=POLLINATIONS_VIDEO_MODEL,
+            width=POLLINATIONS_WIDTH,
+            height=POLLINATIONS_HEIGHT,
+            duration=POLLINATIONS_VIDEO_DURATION,
+            aspect_ratio=POLLINATIONS_VIDEO_ASPECT_RATIO,
+            audio=POLLINATIONS_VIDEO_AUDIO,
+            image_url=ref_url,
+            timeout_seconds=600,
+            retries=1,
+        )
+
+        if not err:
+            break
+
+        # se erro 520 tenta novamente
+        if "520" in err and attempt < 2:
+            time.sleep(6)
+            continue
+
         send_text(
             to,
-            "Não consegui criar o vídeo agora 😕\n\n"
-            f"Motivo: {err}\n\n"
-            "Tente enviar a foto novamente em 1–2 minutos."
+            "O servidor que cria os vídeos está ocupado agora 😕\n\n"
+            "Tente novamente enviando a foto daqui a alguns minutos."
         )
         return
 
     if not blob or mime != "video/mp4":
-        send_text(to, f"Não consegui criar o vídeo (recebi {mime or 'sem tipo'}).")
+        send_text(to, "Não consegui criar o vídeo agora.")
         return
 
     media_id, up_err = wa_upload_media(blob, filename="video.mp4", mime_type="video/mp4")
+
     if up_err:
-        send_text(to, up_err)
+        send_text(to, "O vídeo foi criado mas falhou ao enviar para o WhatsApp.")
         return
+
     send_video_by_id(to, media_id)
 
 # =========================
