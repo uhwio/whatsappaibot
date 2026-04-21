@@ -2,8 +2,8 @@ import os
 import time
 import json
 import hmac
+import jwt
 import base64
-import hashlib
 import secrets
 import logging
 import threading
@@ -48,7 +48,7 @@ logging.basicConfig(
 )
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 log = logging.getLogger("wa-bot")
-log.info("BOOT: started")
+log.info("BOOT: iniciado")
 
 
 # =========================
@@ -63,29 +63,34 @@ MONGO_URI = os.getenv("MONGO_URI")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash")
 
-# Kling AI
+# Pollinations (texto -> imagem)
+POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY")
+POLLINATIONS_IMAGE_MODEL = os.getenv("POLLINATIONS_IMAGE_MODEL", "flux")
+POLLINATIONS_WIDTH = int(os.getenv("POLLINATIONS_WIDTH", "1024"))
+POLLINATIONS_HEIGHT = int(os.getenv("POLLINATIONS_HEIGHT", "1024"))
+
+# Kling
 KLING_ACCESS_KEY = os.getenv("KLING_ACCESS_KEY")
 KLING_SECRET_KEY = os.getenv("KLING_SECRET_KEY")
 KLING_BASE_URL = os.getenv("KLING_BASE_URL", "https://api-singapore.klingai.com").rstrip("/")
 
-# These paths are isolated on purpose because Kling may change naming/versioning.
-# If your account docs show different paths, only change these values.
+# Endpoint que costuma funcionar para image2video
 KLING_CREATE_PATH = os.getenv("KLING_CREATE_PATH", "/v1/videos/image2video")
 KLING_QUERY_PATH_TEMPLATE = os.getenv("KLING_QUERY_PATH_TEMPLATE", "/v1/videos/image2video/{task_id}")
 
-KLING_VIDEO_MODEL = os.getenv("KLING_VIDEO_MODEL", "kling-v3-omni")
-KLING_RESOLUTION = os.getenv("KLING_RESOLUTION", "1080p")
-KLING_ENABLE_AUDIO = os.getenv("KLING_ENABLE_AUDIO", "false").lower() in ("1", "true", "yes", "on")
-KLING_TRANSITION_DURATION = int(os.getenv("KLING_TRANSITION_DURATION", "3"))
-KLING_ASPECT_RATIO = os.getenv("KLING_ASPECT_RATIO", "16:9")
+# Recomendo começar com kling-v2-6 pra estabilizar primeiro
+KLING_VIDEO_MODEL = os.getenv("KLING_VIDEO_MODEL", "kling-v2-6")
 KLING_MODE = os.getenv("KLING_MODE", "std")
+KLING_TRANSITION_DURATION = int(os.getenv("KLING_TRANSITION_DURATION", "5"))  # 5s costuma ser aceito
+KLING_RESOLUTION = os.getenv("KLING_RESOLUTION", "1080p")  # usado só pra cálculo/local config
+KLING_ENABLE_AUDIO = os.getenv("KLING_ENABLE_AUDIO", "false").lower() in ("1", "true", "yes", "on")
 
-# Photo collection behavior
+# Fotos para transição
 PHOTO_TRANSITION_MIN_COUNT = int(os.getenv("PHOTO_TRANSITION_MIN_COUNT", "2"))
 PHOTO_TRANSITION_MAX_COUNT = int(os.getenv("PHOTO_TRANSITION_MAX_COUNT", "5"))
 PHOTO_TRANSITION_MAX_GAP_SECONDS = int(os.getenv("PHOTO_TRANSITION_MAX_GAP_SECONDS", "1800"))
 
-# Public base URL for serving reference images (ngrok / public domain)
+# Hospedagem pública temporária (ainda mantemos caso queira reutilizar)
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 REF_DIR = os.getenv("REF_DIR", "/tmp/wa_ref_images")
 REF_IMAGE_TTL_SECONDS = int(os.getenv("REF_IMAGE_TTL_SECONDS", "3600"))
@@ -93,7 +98,7 @@ REF_IMAGE_TTL_SECONDS = int(os.getenv("REF_IMAGE_TTL_SECONDS", "3600"))
 # WhatsApp webhook dedupe
 DEDUP_TTL_HOURS = int(os.getenv("DEDUP_TTL_HOURS", "48"))
 
-# Cooldowns + resilience
+# Cooldowns
 USER_COOLDOWN_SECONDS = float(os.getenv("USER_COOLDOWN_SECONDS", "1.5"))
 
 # Gemini circuit breaker
@@ -103,32 +108,26 @@ CB_BACKOFF_FACTOR = float(os.getenv("CB_BACKOFF_FACTOR", "2.0"))
 GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
 GEMINI_RETRY_BASE_SLEEP = float(os.getenv("GEMINI_RETRY_BASE_SLEEP", "1.0"))
 CONTEXT_TURNS = int(os.getenv("CONTEXT_TURNS", "8"))
-RATE_LIMIT_MESSAGE = os.getenv("RATE_LIMIT_MESSAGE", "I'm rate-limited right now 😅 Try again in {seconds}s.")
-GENERIC_FAIL_MESSAGE = os.getenv("GEMINI_FAIL_MESSAGE", "I hit a problem just now. Try again in a moment.")
+RATE_LIMIT_MESSAGE = os.getenv("RATE_LIMIT_MESSAGE", "Estou limitado agora 😅 Tente novamente em {seconds}s.")
+GENERIC_FAIL_MESSAGE = os.getenv("GEMINI_FAIL_MESSAGE", "Tive um problema agora. Tente de novo em instantes.")
 
 WELCOME_TEXT = (
-    "Hello! 👋\n\n"
-    "I can:\n"
-    "🖼 Create images from text\n"
-    "🎬 Create a transition video from 2 to 5 photos\n"
-    "💬 Chat and answer questions\n\n"
-    "How to use:\n"
-    "• Send 2 to 5 photos, then send /makevideo\n"
-    "• Send text and I’ll chat with you\n"
-    "• Ask for an image and I’ll generate one\n\n"
-    "Commands:\n"
-    "• /menu      → show help\n"
-    "• /limpar    → clear chat memory\n"
-    "• /photos    → see how many photos are queued\n"
-    "• /resetphotos → clear queued photos\n"
-    "• /makevideo → generate the transition video"
+    "Olá! 👋\n\n"
+    "Eu posso:\n"
+    "🖼 Criar imagens a partir de texto\n"
+    "🎬 Criar vídeo com transição entre 2 e 5 fotos\n"
+    "💬 Conversar e responder perguntas\n\n"
+    "Como usar:\n"
+    "• Envie de 2 a 5 fotos\n"
+    "• Depois mande /makevideo\n"
+    "• Se quiser uma imagem, peça por texto\n\n"
+    "Comandos:\n"
+    "• /menu → ajuda\n"
+    "• /limpar → apagar memória da conversa\n"
+    "• /photos → ver quantas fotos estão na fila\n"
+    "• /resetphotos → apagar fotos da fila\n"
+    "• /makevideo → gerar o vídeo"
 )
-
-# Image generation via Pollinations is kept for text-to-image only
-POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY")
-POLLINATIONS_IMAGE_MODEL = os.getenv("POLLINATIONS_IMAGE_MODEL", "flux")
-POLLINATIONS_WIDTH = int(os.getenv("POLLINATIONS_WIDTH", "1024"))
-POLLINATIONS_HEIGHT = int(os.getenv("POLLINATIONS_HEIGHT", "1024"))
 
 
 # =========================
@@ -155,7 +154,7 @@ def ensure_indexes():
         users.create_index([("transition_photos.ts", ASCENDING)], name="transition_photos_ts")
         log.info("BOOT: indexes ok")
     except OperationFailure as e:
-        log.warning("BOOT: index creation failed: %s", type(e).__name__)
+        log.warning("BOOT: falha ao criar indexes: %s", type(e).__name__)
 
 
 ensure_indexes()
@@ -184,11 +183,8 @@ def _guess_mime(blob: bytes) -> str:
     return "application/octet-stream"
 
 
-def _safe_int(v: Any, default: int) -> int:
-    try:
-        return int(v)
-    except Exception:
-        return default
+def image_bytes_to_base64(image_bytes: bytes) -> str:
+    return base64.b64encode(image_bytes).decode("utf-8")
 
 
 # =========================
@@ -198,7 +194,10 @@ def mark_processed_once(mid: Optional[str]) -> bool:
     if not mid:
         return True
     try:
-        processed.insert_one({"_id": mid, "expiresAt": datetime.now(timezone.utc) + timedelta(hours=DEDUP_TTL_HOURS)})
+        processed.insert_one({
+            "_id": mid,
+            "expiresAt": datetime.now(timezone.utc) + timedelta(hours=DEDUP_TTL_HOURS)
+        })
         return True
     except DuplicateKeyError:
         return False
@@ -224,7 +223,12 @@ def wa_send(payload: Dict[str, Any]) -> None:
 
 
 def send_text(to: str, body: str):
-    wa_send({"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": body}})
+    wa_send({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": body}
+    })
 
 
 def wa_upload_media(media_bytes: bytes, filename: str, mime_type: str) -> Tuple[Optional[str], Optional[str]]:
@@ -238,22 +242,32 @@ def wa_upload_media(media_bytes: bytes, filename: str, mime_type: str) -> Tuple[
         )
         if r.status_code < 200 or r.status_code >= 300:
             log.error("wa_media_http_%s: %s", r.status_code, _short(r.text))
-            return None, f"Error uploading media to WhatsApp ({r.status_code}). {_short(r.text)}"
+            return None, f"Erro ao enviar mídia pro WhatsApp ({r.status_code}). {_short(r.text)}"
         media_id = (r.json() or {}).get("id")
         if not media_id:
-            return None, "WhatsApp did not return a media id."
+            return None, "WhatsApp não retornou id da mídia."
         return media_id, None
     except Exception as e:
         log.error("wa_upload_failed: %s", type(e).__name__)
-        return None, "Failed to upload media to WhatsApp."
+        return None, "Falha ao enviar mídia pro WhatsApp."
 
 
 def send_image_by_id(to: str, media_id: str):
-    wa_send({"messaging_product": "whatsapp", "to": to, "type": "image", "image": {"id": media_id, "caption": "🖼 Here is your image"}})
+    wa_send({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "image",
+        "image": {"id": media_id, "caption": "🖼 Aqui está sua imagem"}
+    })
 
 
 def send_video_by_id(to: str, media_id: str):
-    wa_send({"messaging_product": "whatsapp", "to": to, "type": "video", "video": {"id": media_id, "caption": "🎬 Here is your video"}})
+    wa_send({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "video",
+        "video": {"id": media_id, "caption": "🎬 Aqui está seu vídeo"}
+    })
 
 
 # =========================
@@ -267,25 +281,25 @@ def wa_download_incoming_media(media_id: str) -> Tuple[Optional[bytes], Optional
             timeout=20,
         )
         if meta.status_code < 200 or meta.status_code >= 300:
-            return None, None, f"Error getting media info ({meta.status_code}). {_short(meta.text)}"
+            return None, None, f"Erro ao pegar info da mídia ({meta.status_code}). {_short(meta.text)}"
 
         j = meta.json() or {}
         url = j.get("url")
         mime = j.get("mime_type") or "application/octet-stream"
         if not url:
-            return None, None, "WhatsApp did not return the media URL."
+            return None, None, "WhatsApp não retornou a URL da mídia."
 
         blob = http.get(url, headers={"Authorization": f"Bearer {WA_TOKEN}"}, timeout=60)
         if blob.status_code < 200 or blob.status_code >= 300:
-            return None, None, f"Error downloading media ({blob.status_code}). {_short(blob.text)}"
+            return None, None, f"Erro ao baixar mídia ({blob.status_code}). {_short(blob.text)}"
 
         return blob.content, mime, None
     except Exception as e:
-        return None, None, f"Failed to download media: {type(e).__name__}"
+        return None, None, f"Falha ao baixar mídia: {type(e).__name__}"
 
 
 # =========================
-# Reference image hosting
+# Reference image hosting / local storage
 # =========================
 def cleanup_old_refs():
     now = time.time()
@@ -302,7 +316,7 @@ def cleanup_old_refs():
         pass
 
 
-def store_reference_blob(uid: str, image_bytes: bytes) -> str:
+def store_reference_blob(image_bytes: bytes) -> str:
     cleanup_old_refs()
     token = secrets.token_urlsafe(20)
     path = os.path.join(REF_DIR, token)
@@ -312,7 +326,7 @@ def store_reference_blob(uid: str, image_bytes: bytes) -> str:
 
 
 def store_transition_photo(uid: str, image_bytes: bytes) -> str:
-    token = store_reference_blob(uid, image_bytes)
+    token = store_reference_blob(image_bytes)
     now = time.time()
 
     doc = users.find_one({"_id": uid}, {"transition_photos": 1}) or {}
@@ -356,19 +370,26 @@ def get_transition_photos(uid: str) -> List[Dict[str, Any]]:
     return out
 
 
-def get_transition_photo_urls(uid: str) -> List[str]:
-    if not PUBLIC_BASE_URL:
-        return []
+def get_transition_photo_blobs(uid: str) -> List[bytes]:
+    photos = get_transition_photos(uid)
+    blobs: List[bytes] = []
 
-    out = []
-    now = time.time()
-    for item in get_transition_photos(uid):
+    for item in photos:
         token = item.get("token")
-        ts = item.get("ts")
-        if isinstance(token, str) and isinstance(ts, (int, float)):
-            if now - ts <= REF_IMAGE_TTL_SECONDS:
-                out.append(f"{PUBLIC_BASE_URL}/ref/{token}")
-    return out
+        if not token:
+            continue
+
+        path = os.path.join(REF_DIR, token)
+        if not os.path.isfile(path):
+            continue
+
+        try:
+            with open(path, "rb") as f:
+                blobs.append(f.read())
+        except Exception:
+            continue
+
+    return blobs
 
 
 def clear_transition_photos(uid: str):
@@ -380,13 +401,13 @@ def serve_ref(token: str):
     cleanup_old_refs()
     path = os.path.join(REF_DIR, token)
     if not os.path.isfile(path):
-        return "Not found", 404
+        return "Não encontrado", 404
     try:
         with open(path, "rb") as f:
             blob = f.read()
         return Response(blob, status=200, mimetype=_guess_mime(blob))
     except Exception:
-        return "Error", 500
+        return "Erro", 500
 
 
 # =========================
@@ -394,7 +415,7 @@ def serve_ref(token: str):
 # =========================
 def pollinations_generate_image(prompt: str, width: int, height: int, timeout_seconds: int = 180) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     if not POLLINATIONS_API_KEY:
-        return None, None, "Pollinations not configured."
+        return None, None, "Pollinations não configurado."
 
     try:
         from urllib.parse import quote
@@ -410,7 +431,7 @@ def pollinations_generate_image(prompt: str, width: int, height: int, timeout_se
         r = http.get(url, params=params, headers=headers, timeout=timeout_seconds)
 
         if r.status_code < 200 or r.status_code >= 300:
-            return None, None, f"Pollinations error ({r.status_code}). {_short(r.text)}"
+            return None, None, f"Erro Pollinations ({r.status_code}). {_short(r.text)}"
 
         ctype = (r.headers.get("content-type") or "").lower()
         if "image/" in ctype:
@@ -423,29 +444,29 @@ def pollinations_generate_image(prompt: str, width: int, height: int, timeout_se
                 if isinstance(b64, str) and b64:
                     blob = base64.b64decode(b64)
                     return blob, _guess_mime(blob), None
-                return None, None, f"Pollinations returned JSON without image. {_short(r.text)}"
+                return None, None, f"Pollinations retornou JSON sem imagem. {_short(r.text)}"
             except Exception:
-                return None, None, f"Pollinations returned unreadable JSON. {_short(r.text)}"
+                return None, None, f"Pollinations retornou JSON inválido. {_short(r.text)}"
 
         blob = r.content
         return blob, _guess_mime(blob), None
     except requests.exceptions.Timeout:
-        return None, None, "Pollinations timed out."
+        return None, None, "Pollinations demorou demais e expirou."
     except Exception as e:
-        return None, None, f"Pollinations request failed: {type(e).__name__}"
+        return None, None, f"Falha na requisição Pollinations: {type(e).__name__}"
 
 
 def generate_and_send_image(to: str, prompt: str):
-    send_text(to, "Creating your image... 🖼")
+    send_text(to, "Criando sua imagem... 🖼")
     blob, mime, err = pollinations_generate_image(prompt, POLLINATIONS_WIDTH, POLLINATIONS_HEIGHT)
     if err:
         send_text(to, err)
         return
     if not blob or not mime or not mime.startswith("image/"):
-        send_text(to, f"Couldn't create the image (got {mime or 'unknown'}).")
+        send_text(to, f"Não consegui criar a imagem (recebi {mime or 'desconhecido'}).")
         return
 
-    filename = "image.png" if mime == "image/png" else "image.jpg"
+    filename = "imagem.png" if mime == "image/png" else "imagem.jpg"
     media_id, up_err = wa_upload_media(blob, filename=filename, mime_type=mime)
     if up_err:
         send_text(to, up_err)
@@ -454,36 +475,38 @@ def generate_and_send_image(to: str, prompt: str):
 
 
 # =========================
-# Kling AI
+# Kling
 # =========================
 def kling_is_configured() -> bool:
-    return bool(KLING_ACCESS_KEY and KLING_SECRET_KEY and KLING_BASE_URL and PUBLIC_BASE_URL)
+    return bool(KLING_ACCESS_KEY and KLING_SECRET_KEY and KLING_BASE_URL)
 
 
 def kling_estimated_credits(photo_count: int, seconds_per_transition: int) -> int:
     transitions = max(0, photo_count - 1)
-    # VIDEO 3.0 No Native Audio 1080p = 8 credits/sec
+    # 1080p sem áudio = 8 créditos/segundo
     return transitions * seconds_per_transition * 8
 
 
-def kling_build_auth_headers(method: str, path: str, body: Optional[dict] = None) -> Dict[str, str]:
-    """
-    IMPORTANT:
-    This helper isolates Kling auth because public browsing access did not expose
-    the full exact signing recipe. Replace only this function if your Kling account
-    docs use a different signing/token method.
-    """
-    timestamp = str(int(time.time()))
-    body_str = json.dumps(body or {}, separators=(",", ":"), ensure_ascii=False)
+def kling_build_auth_headers() -> Dict[str, str]:
+    current_time = int(time.time())
 
-    signing_string = f"{method}\n{path}\n{timestamp}\n{body_str}"
-    signature = hmac.new(
-        KLING_SECRET_KEY.encode("utf-8"),
-        signing_string.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
+    headers = {
+        "alg": "HS256",
+        "typ": "JWT",
+    }
 
-    token = f"{KLING_ACCESS_KEY}:{timestamp}:{signature}"
+    payload = {
+        "iss": KLING_ACCESS_KEY,
+        "exp": current_time + 1800,
+        "nbf": current_time - 5,
+    }
+
+    token = jwt.encode(
+        payload,
+        KLING_SECRET_KEY,
+        algorithm="HS256",
+        headers=headers
+    )
 
     return {
         "Authorization": f"Bearer {token}",
@@ -491,101 +514,47 @@ def kling_build_auth_headers(method: str, path: str, body: Optional[dict] = None
     }
 
 
-def kling_extract_task_id(data: dict) -> Optional[str]:
-    candidates = [
-        data.get("task_id"),
-        data.get("id"),
-        (data.get("data") or {}).get("task_id") if isinstance(data.get("data"), dict) else None,
-        (data.get("data") or {}).get("id") if isinstance(data.get("data"), dict) else None,
-    ]
-    for c in candidates:
-        if isinstance(c, str) and c.strip():
-            return c
-    return None
-
-
-def kling_extract_status(data: dict) -> str:
-    candidates = [
-        data.get("status"),
-        data.get("task_status"),
-        (data.get("data") or {}).get("status") if isinstance(data.get("data"), dict) else None,
-        (data.get("data") or {}).get("task_status") if isinstance(data.get("data"), dict) else None,
-    ]
-    for c in candidates:
-        if isinstance(c, str):
-            return c.lower().strip()
-    return ""
-
-
-def kling_extract_video_url(data: dict) -> Optional[str]:
-    candidates = []
-
-    if isinstance(data.get("video_url"), str):
-        candidates.append(data.get("video_url"))
-
-    d = data.get("data")
-    if isinstance(d, dict):
-        if isinstance(d.get("video_url"), str):
-            candidates.append(d.get("video_url"))
-
-        result = d.get("result")
-        if isinstance(result, dict) and isinstance(result.get("video_url"), str):
-            candidates.append(result.get("video_url"))
-
-        works = d.get("works")
-        if isinstance(works, list):
-            for w in works:
-                if isinstance(w, dict):
-                    resource = w.get("resource")
-                    if isinstance(resource, dict) and isinstance(resource.get("resource"), str):
-                        candidates.append(resource.get("resource"))
-
-    result_top = data.get("result")
-    if isinstance(result_top, dict) and isinstance(result_top.get("video_url"), str):
-        candidates.append(result_top.get("video_url"))
-
-    for c in candidates:
-        if c and isinstance(c, str):
-            return c
-    return None
-
-
-def kling_create_transition_task(start_image_url: str, end_image_url: str) -> Tuple[Optional[str], Optional[str]]:
+def kling_create_transition_task(start_image_bytes: bytes, end_image_bytes: bytes) -> Tuple[Optional[str], Optional[str]]:
     if not kling_is_configured():
-        return None, "Kling is not configured correctly. Check KLING_* and PUBLIC_BASE_URL."
+        return None, "Kling não está configurado corretamente."
 
     path = KLING_CREATE_PATH
 
     body = {
         "model_name": KLING_VIDEO_MODEL,
+        "image": image_bytes_to_base64(start_image_bytes),
+        "image_tail": image_bytes_to_base64(end_image_bytes),
         "prompt": "smooth cinematic transition between the two photos, elegant motion, natural morphing, stable composition, high quality",
-        "duration": KLING_TRANSITION_DURATION,
+        "duration": str(KLING_TRANSITION_DURATION),
         "mode": KLING_MODE,
-        "resolution": KLING_RESOLUTION,
-        "aspect_ratio": KLING_ASPECT_RATIO,
-        "sound": False,
-        # Common pattern for start/end frame style requests:
-        "image_url": [start_image_url, end_image_url],
     }
 
     try:
         r = http.post(
             f"{KLING_BASE_URL}{path}",
-            headers=kling_build_auth_headers("POST", path, body),
+            headers=kling_build_auth_headers(),
             json=body,
-            timeout=60,
+            timeout=90,
         )
+
         if r.status_code < 200 or r.status_code >= 300:
             return None, f"Kling create task failed ({r.status_code}): {_short(r.text)}"
 
         data = r.json() or {}
-        task_id = kling_extract_task_id(data)
+
+        task_id = (
+            data.get("data", {}).get("task_id")
+            if isinstance(data.get("data"), dict)
+            else None
+        ) or data.get("task_id") or data.get("id")
+
         if not task_id:
-            return None, f"Kling did not return a task id. Raw: {_short(json.dumps(data, ensure_ascii=False))}"
+            return None, f"Kling não retornou task id: {_short(json.dumps(data, ensure_ascii=False))}"
+
         return task_id, None
 
     except Exception as e:
-        return None, f"Failed to create Kling task: {type(e).__name__}"
+        return None, f"Falha ao criar task no Kling: {type(e).__name__}"
 
 
 def kling_poll_video_result(task_id: str, timeout_seconds: int = 900) -> Tuple[Optional[bytes], Optional[str]]:
@@ -596,39 +565,47 @@ def kling_poll_video_result(task_id: str, timeout_seconds: int = 900) -> Tuple[O
         try:
             r = http.get(
                 f"{KLING_BASE_URL}{path}",
-                headers=kling_build_auth_headers("GET", path, None),
+                headers=kling_build_auth_headers(),
                 timeout=30,
             )
+
             if r.status_code < 200 or r.status_code >= 300:
                 return None, f"Kling query failed ({r.status_code}): {_short(r.text)}"
 
             data = r.json() or {}
-            status = kling_extract_status(data)
+            obj = data.get("data", {}) if isinstance(data.get("data"), dict) else data
+            status = (obj.get("task_status") or obj.get("status") or "").lower()
 
             if status in ("succeed", "success", "completed", "done"):
-                video_url = kling_extract_video_url(data)
+                video_url = (
+                    obj.get("video_url")
+                    or (obj.get("task_result") or {}).get("video_url")
+                    or (obj.get("result") or {}).get("video_url")
+                )
+
                 if not video_url:
-                    return None, "Kling completed but did not return a video URL."
+                    return None, "Kling concluiu mas não retornou video_url."
 
                 vr = http.get(video_url, timeout=180)
                 if vr.status_code < 200 or vr.status_code >= 300:
-                    return None, f"Failed to download Kling video ({vr.status_code})."
+                    return None, f"Falha ao baixar vídeo do Kling ({vr.status_code})."
+
                 return vr.content, None
 
             if status in ("failed", "error", "canceled", "cancelled"):
-                return None, f"Kling generation failed: {_short(json.dumps(data, ensure_ascii=False))}"
+                return None, f"Kling falhou na geração: {_short(json.dumps(obj, ensure_ascii=False))}"
 
             time.sleep(5)
 
         except Exception as e:
-            return None, f"Failed while polling Kling task: {type(e).__name__}"
+            return None, f"Falha ao consultar task do Kling: {type(e).__name__}"
 
-    return None, "Kling took too long to finish."
+    return None, "Kling demorou demais para concluir."
 
 
 def concat_mp4_clips(clips: List[bytes]) -> Tuple[Optional[bytes], Optional[str]]:
     if not clips:
-        return None, "No clips to concatenate."
+        return None, "Nenhum clip para juntar."
 
     with tempfile.TemporaryDirectory() as tmp:
         paths = []
@@ -645,7 +622,7 @@ def concat_mp4_clips(clips: List[bytes]) -> Tuple[Optional[bytes], Optional[str]
 
         out_path = os.path.join(tmp, "final.mp4")
 
-        # First try stream copy
+        # tenta sem reencode
         cmd_copy = [
             "ffmpeg",
             "-y",
@@ -660,7 +637,7 @@ def concat_mp4_clips(clips: List[bytes]) -> Tuple[Optional[bytes], Optional[str]
             with open(out_path, "rb") as f:
                 return f.read(), None
 
-        # Fallback: re-encode
+        # fallback com reencode
         cmd_reencode = [
             "ffmpeg",
             "-y",
@@ -677,37 +654,37 @@ def concat_mp4_clips(clips: List[bytes]) -> Tuple[Optional[bytes], Optional[str]
         ]
         proc2 = subprocess.run(cmd_reencode, capture_output=True, text=True)
         if proc2.returncode != 0:
-            return None, f"ffmpeg failed: {_short(proc2.stderr or proc.stderr)}"
+            return None, f"ffmpeg falhou: {_short(proc2.stderr or proc.stderr)}"
 
         with open(out_path, "rb") as f:
             return f.read(), None
 
 
-def generate_and_send_kling_transition_video(to: str, photo_urls: List[str]):
-    photo_count = len(photo_urls)
+def generate_and_send_kling_transition_video(to: str, photo_blobs: List[bytes]):
+    photo_count = len(photo_blobs)
 
     if photo_count < PHOTO_TRANSITION_MIN_COUNT:
-        send_text(to, f"Please send at least {PHOTO_TRANSITION_MIN_COUNT} photos.")
+        send_text(to, f"Envie pelo menos {PHOTO_TRANSITION_MIN_COUNT} fotos.")
         return
 
     if photo_count > PHOTO_TRANSITION_MAX_COUNT:
-        photo_urls = photo_urls[:PHOTO_TRANSITION_MAX_COUNT]
-        photo_count = len(photo_urls)
+        photo_blobs = photo_blobs[:PHOTO_TRANSITION_MAX_COUNT]
+        photo_count = len(photo_blobs)
 
     est = kling_estimated_credits(photo_count, KLING_TRANSITION_DURATION)
     send_text(
         to,
-        f"Creating your {photo_count}-photo transition video in 1080p, no audio 🎬\n"
-        f"Estimated Kling cost: ~{est} credits."
+        f"Criando vídeo com {photo_count} fotos em 1080p, sem áudio 🎬\n"
+        f"Custo estimado no Kling: ~{est} créditos."
     )
 
     clips: List[bytes] = []
 
-    for i in range(len(photo_urls) - 1):
-        start_url = photo_urls[i]
-        end_url = photo_urls[i + 1]
+    for i in range(len(photo_blobs) - 1):
+        start_blob = photo_blobs[i]
+        end_blob = photo_blobs[i + 1]
 
-        task_id, err = kling_create_transition_task(start_url, end_url)
+        task_id, err = kling_create_transition_task(start_blob, end_blob)
         if err:
             send_text(to, err)
             return
@@ -752,7 +729,7 @@ def cb_trip():
     global _cb_until, _cb_cooldown
     now = time.time()
     _cb_until = now + _cb_cooldown
-    log.warning("gemini_circuit_open:%ss", int(_cb_cooldown))
+    log.warning("gemini_circuit_aberto:%ss", int(_cb_cooldown))
     _cb_cooldown = min(float(CB_MAX_COOLDOWN), _cb_cooldown * CB_BACKOFF_FACTOR)
 
 
@@ -823,13 +800,15 @@ def chat_reply(uid: str, prompt: str) -> str:
 # =========================
 # Intent detection
 # =========================
-def seems_like_image_request(text: str) -> bool:
-    t = text.lower().strip()
-    triggers = [
-        "generate an image", "create an image", "make an image",
-        "draw", "illustration", "image of", "photo of", "art of"
+def parece_pedido_de_imagem(texto: str) -> bool:
+    t = texto.lower().strip()
+    gatilhos = [
+        "gera uma imagem", "gerar uma imagem", "crie uma imagem", "criar uma imagem",
+        "faz uma imagem", "fazer uma imagem", "desenha", "desenhe", "desenhar",
+        "uma imagem de", "imagem de", "foto de", "crie um desenho", "desenho de",
+        "criar arte", "arte de", "ilustração", "ilustracao"
     ]
-    return any(x in t for x in triggers)
+    return any(g in t for g in gatilhos)
 
 
 # =========================
@@ -874,16 +853,16 @@ def inbound():
 
                     mtype = msg.get("type")
 
-                    # ---------- IMAGE = queue for transition video
+                    # ---------- FOTO = adiciona na fila
                     if mtype == "image":
                         media_id = (msg.get("image") or {}).get("id")
                         if not media_id:
-                            send_text(sender, "I couldn't read that photo. Please send it again.")
+                            send_text(sender, "Não consegui ler essa foto. Tente enviar de novo.")
                             continue
 
                         img_bytes, img_mime, err = wa_download_incoming_media(media_id)
                         if err or not img_bytes:
-                            send_text(sender, err or "Failed to download the photo.")
+                            send_text(sender, err or "Falhei ao baixar a foto.")
                             continue
 
                         store_transition_photo(sender, img_bytes)
@@ -892,18 +871,18 @@ def inbound():
                         if photo_count >= PHOTO_TRANSITION_MAX_COUNT:
                             send_text(
                                 sender,
-                                f"Photo {photo_count}/{PHOTO_TRANSITION_MAX_COUNT} received ✅\n"
-                                f"Send /makevideo when you're ready."
+                                f"Foto {photo_count}/{PHOTO_TRANSITION_MAX_COUNT} recebida ✅\n"
+                                f"Agora mande /makevideo."
                             )
                         else:
                             send_text(
                                 sender,
-                                f"Photo {photo_count}/{PHOTO_TRANSITION_MAX_COUNT} received 📸\n"
-                                f"Send more photos, or send /makevideo once you have at least {PHOTO_TRANSITION_MIN_COUNT}."
+                                f"Foto {photo_count}/{PHOTO_TRANSITION_MAX_COUNT} recebida 📸\n"
+                                f"Envie mais fotos ou mande /makevideo quando tiver pelo menos {PHOTO_TRANSITION_MIN_COUNT}."
                             )
                         continue
 
-                    # ---------- NON-TEXT
+                    # ---------- IGNORA TIPOS NÃO TEXTO
                     if mtype != "text":
                         continue
 
@@ -913,7 +892,7 @@ def inbound():
 
                     low = txt.lower().strip()
 
-                    # Commands
+                    # comandos
                     if low in ("/menu", "menu", "/start", "start", "/help", "help"):
                         send_text(sender, WELCOME_TEXT)
                         continue
@@ -924,7 +903,7 @@ def inbound():
                             {"$unset": {"history": "", "transition_photos": ""}},
                             upsert=True,
                         )
-                        send_text(sender, "Memory cleared 🧹")
+                        send_text(sender, "Memória apagada 🧹")
                         continue
 
                     if low == "/photos":
@@ -932,39 +911,34 @@ def inbound():
                         est = kling_estimated_credits(count, KLING_TRANSITION_DURATION) if count >= 2 else 0
                         send_text(
                             sender,
-                            f"You currently have {count} queued photo(s).\n"
-                            f"Min: {PHOTO_TRANSITION_MIN_COUNT}, max: {PHOTO_TRANSITION_MAX_COUNT}.\n"
-                            f"Estimated cost right now: ~{est} credits."
+                            f"Você tem {count} foto(s) na fila.\n"
+                            f"Mínimo: {PHOTO_TRANSITION_MIN_COUNT}\n"
+                            f"Máximo: {PHOTO_TRANSITION_MAX_COUNT}\n"
+                            f"Custo estimado agora: ~{est} créditos."
                         )
                         continue
 
                     if low == "/resetphotos":
                         clear_transition_photos(sender)
-                        send_text(sender, "Queued photos cleared.")
+                        send_text(sender, "Fotos da fila apagadas.")
                         continue
 
                     if low == "/makevideo":
-                        photo_urls = get_transition_photo_urls(sender)
-                        count = len(photo_urls)
-
-                        if not PUBLIC_BASE_URL:
-                            send_text(sender, "PUBLIC_BASE_URL is missing, so I can't expose the photos to Kling.")
-                            continue
+                        photo_blobs = get_transition_photo_blobs(sender)
+                        count = len(photo_blobs)
 
                         if count < PHOTO_TRANSITION_MIN_COUNT:
-                            send_text(sender, f"Please send at least {PHOTO_TRANSITION_MIN_COUNT} photos first.")
+                            send_text(sender, f"Envie pelo menos {PHOTO_TRANSITION_MIN_COUNT} fotos primeiro.")
                             continue
 
                         if count > PHOTO_TRANSITION_MAX_COUNT:
-                            photo_urls = photo_urls[:PHOTO_TRANSITION_MAX_COUNT]
-                            count = len(photo_urls)
+                            photo_blobs = photo_blobs[:PHOTO_TRANSITION_MAX_COUNT]
 
-                        # Clear queue before async generation so duplicates don't pile up
                         clear_transition_photos(sender)
 
                         threading.Thread(
                             target=generate_and_send_kling_transition_video,
-                            args=(sender, photo_urls),
+                            args=(sender, photo_blobs),
                             daemon=True
                         ).start()
                         continue
@@ -973,13 +947,19 @@ def inbound():
                     if users.count_documents({"_id": sender}, limit=1) == 0:
                         send_text(sender, WELCOME_TEXT)
 
-                    # image generation
-                    if seems_like_image_request(txt):
+                    # geração de imagem
+                    if parece_pedido_de_imagem(txt):
                         prompt = txt
+                        for g in [
+                            "gera uma imagem de", "gerar uma imagem de", "crie uma imagem de", "criar uma imagem de",
+                            "faz uma imagem de", "fazer uma imagem de", "uma imagem de", "imagem de"
+                        ]:
+                            prompt = prompt.lower().replace(g, "").strip()
+                        prompt = prompt.strip() or txt
                         generate_and_send_image(sender, prompt)
                         continue
 
-                    # chat
+                    # conversa
                     reply = chat_reply(sender, txt)
                     send_text(sender, reply)
 
